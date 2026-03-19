@@ -32,6 +32,9 @@ public class NoOpMetricsCollector implements MetricsCollector {
 
     @Override
     public void recordThrottleCount() { }
+    @Override
+    public void recordQueueRejection(CatalogOperation.OperationType type) { }
+
 
     @Override
     public void flush() { }

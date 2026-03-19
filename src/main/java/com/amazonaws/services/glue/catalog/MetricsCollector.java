@@ -63,6 +63,13 @@ public interface MetricsCollector {
      * Records a throttle event (HTTP 429) from the Glue API.
      */
     void recordThrottleCount();
+    /**
+     * Records a queue rejection event when the bounded queue is full.
+     *
+     * @param type the operation type that was rejected
+     */
+    void recordQueueRejection(CatalogOperation.OperationType type);
+
 
     /**
      * Flushes all buffered metrics to the underlying metrics service.

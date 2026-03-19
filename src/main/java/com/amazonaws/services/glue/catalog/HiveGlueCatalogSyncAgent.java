@@ -5,7 +5,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.services.glue.AWSGlue;
@@ -47,10 +47,20 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private static final String GLUE_CATALOG_RETRY_INITIAL_BACKOFF_MS = "glue.catalog.retry.initialBackoffMs";
 	private static final String GLUE_CATALOG_RETRY_BACKOFF_MULTIPLIER = "glue.catalog.retry.backoffMultiplier";
 	private static final String GLUE_CATALOG_RETRY_MAX_ATTEMPTS = "glue.catalog.retry.maxAttempts";
+	private static final String GLUE_CATALOG_QUEUE_CAPACITY = "glue.catalog.queue.capacity";
+	private static final int DEFAULT_QUEUE_CAPACITY = 50000;
+
+	/**
+	 * Dedicated logger for rejected operations. Outputs machine-parseable TSV lines
+	 * (database, table, operation_type, timestamp_ms) that downstream jobs can consume
+	 * to manually sync objects that fell out of the queue.
+	 */
+	private static final Logger REJECTED_OPS_LOG =
+			LoggerFactory.getLogger("com.amazonaws.services.glue.catalog.RejectedOperations");
 
 	private Configuration config = null;
 	private Thread queueProcessor;
-	private volatile ConcurrentLinkedQueue<CatalogOperation> operationQueue;
+	private volatile LinkedBlockingQueue<CatalogOperation> operationQueue;
 	private boolean dropTableIfExists = false;
 	private boolean createMissingDB = true;
 	private int noEventSleepDuration;
@@ -66,6 +76,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private double retryBackoffMultiplier = 2.0;
 	private int retryMaxAttempts = 5;
 	private final Set<String> blacklistedTables = ConcurrentHashMap.newKeySet();
+	private MetricsCollector metricsCollector;
 
 	/**
 	 * Private class to cleanup the sync agent - to be used in a Runtime shutdown
@@ -142,7 +153,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				}
 
 				// Record queue depth before draining
-				metricsCollector.recordQueueDepth(operationQueue.size());
+				int currentDepth = operationQueue.size();
+				int totalCapacity = currentDepth + operationQueue.remainingCapacity();
+				metricsCollector.recordQueueDepth(currentDepth);
+				if (currentDepth > totalCapacity * 0.8) {
+					LOG.warn("Queue depth {} exceeds 80% of capacity ({})", currentDepth, totalCapacity);
+				}
 
 				// Drain all operations from the queue
 				List<CatalogOperation> batch = new ArrayList<>();
@@ -657,11 +673,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		// Create Glue client
 		this.glueClient = GlueClientFactory.createClient(config);
 
-		operationQueue = new ConcurrentLinkedQueue<>();
+		operationQueue = new LinkedBlockingQueue<>(
+				config.getInt(GLUE_CATALOG_QUEUE_CAPACITY, DEFAULT_QUEUE_CAPACITY));
 
 		// start the queue processor thread
 		CloudWatchLogsReporter cwlr = new CloudWatchLogsReporter(this.config);
-		MetricsCollector metricsCollector = MetricsCollectorFactory.create(config);
+		this.metricsCollector = MetricsCollectorFactory.create(config);
 		GlueCatalogQueueProcessor glueCatalogQueueProcessor = new GlueCatalogQueueProcessor(
 				this.glueClient, cwlr, metricsCollector, this.catalogId, this.dropTableIfExists, this.createMissingDB,
 				this.batchWindowSeconds * 1000, this.retryInitialBackoffMs,
@@ -673,10 +690,11 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		Runtime.getRuntime()
 				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(glueCatalogQueueProcessor, metricsCollector), "Shutdown-thread"));
 
-		LOG.info(String.format("%s online, using GDC Direct API (region: %s, catalogId: %s)",
+		LOG.info(String.format("%s online, using GDC Direct API (region: %s, catalogId: %s, queueCapacity: %d)",
 				this.getClass().getCanonicalName(),
 				config.get(GlueClientFactory.GLUE_CATALOG_REGION, GlueClientFactory.DEFAULT_REGION),
-				this.catalogId != null ? this.catalogId : "default"));
+				this.catalogId != null ? this.catalogId : "default",
+				operationQueue.remainingCapacity()));
 	}
 
 	/**
@@ -742,11 +760,25 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
 	/**
 	 * Enqueues a CatalogOperation for processing by the queue processor.
+	 * Uses non-blocking offer() — if the bounded queue is full, the operation
+	 * is rejected and logged to the dedicated rejected-operations logger in
+	 * machine-parseable TSV format for downstream manual sync.
 	 */
 	boolean addToQueue(CatalogOperation operation) {
 		try {
-			operationQueue.add(operation);
-			return true;
+			if (operationQueue.offer(operation)) {
+				return true;
+			}
+			// Queue is full — reject with parseable output
+			metricsCollector.recordQueueRejection(operation.getType());
+			LOG.error("Queue full — rejected operation {} for {}",
+					operation.getType(), operation.getFullTableName());
+			REJECTED_OPS_LOG.error("{}\t{}\t{}\t{}",
+					operation.getDatabaseName(),
+					operation.getTableName() != null ? operation.getTableName() : "",
+					operation.getType(),
+					System.currentTimeMillis());
+			return false;
 		} catch (Exception e) {
 			LOG.error("Failed to enqueue operation {} for {}: {}",
 					operation.getType(), operation.getFullTableName(), e.getMessage());

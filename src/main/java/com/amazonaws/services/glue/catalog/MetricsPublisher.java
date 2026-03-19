@@ -164,6 +164,16 @@ public class MetricsPublisher implements MetricsCollector {
                 .withUnit(StandardUnit.Count)
                 .withTimestamp(new Date()));
     }
+    @Override
+    public void recordQueueRejection(CatalogOperation.OperationType type) {
+        buffer.add(new MetricDatum()
+                .withMetricName("QueueRejection")
+                .withValue(1.0)
+                .withUnit(StandardUnit.Count)
+                .withTimestamp(new Date())
+                .withDimensions(operationTypeDimension(type)));
+    }
+
 
     @Override
     public void flush() {
