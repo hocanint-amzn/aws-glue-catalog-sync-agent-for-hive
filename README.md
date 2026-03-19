@@ -225,8 +225,14 @@ integration-tests/
 │   ├── 02_create_iceberg_tables.sql  # Iceberg table scenarios
 │   ├── 03_alter_and_drop.sql         # ALTER TABLE, DROP PARTITION
 │   └── 04_drop_table.sql            # DROP TABLE (runs after sync window)
+├── load-test/
+│   ├── generate-load.py              # DDL generator for load scenarios
+│   ├── validate-load.py              # Sync completeness + metrics validator
+│   ├── run-load-test.sh              # Full load test orchestrator
+│   └── README.md                     # Detailed load test documentation
 ├── scripts/
-│   └── bootstrap-install-agent.sh    # EMR bootstrap to install the JAR
+│   ├── bootstrap-install-agent.sh    # EMR bootstrap to install the JAR
+│   └── run-spark-sql.sh              # Spark SQL wrapper for EMR steps
 ├── validate/
 │   └── validate_sync.py             # GDC metadata + Athena readability checks
 ├── run-integ-tests.sh               # Full lifecycle orchestrator
@@ -234,6 +240,112 @@ integration-tests/
 ├── test-scenarios.md                # Detailed test case descriptions
 └── README.md                        # Integration test documentation
 ```
+
+## Load Tests
+
+The project includes a load testing framework that generates high-volume HMS events via Spark SQL on EMR, waits for the sync agent to process them, and validates correctness and performance against the Glue Data Catalog and CloudWatch Metrics.
+
+### Scenarios
+
+| Scenario | DBs | Tables/DB | Partitions/Table | Total Ops | Purpose |
+|---|---|---|---|---|---|
+| `burst-create` | 1 | 100 | 0 | 100 | CreateTable throughput, batch merging |
+| `partition-heavy` | 1 | 5 | 200 | ~1,005 | BatchCreatePartition batching, Glue API limits |
+| `multi-db` | 10 | 10 | 10 | ~1,100 | CreateDatabase + cross-DB parallelism |
+| `mixed-ops` | 1 | 50 | 20 | ~150 | Create → Alter → Drop interleaving |
+| `sustained` | 1 | 500 | 5 | ~3,000 | Queue depth, memory, long-running stability |
+
+### Prerequisites
+
+- AWS CLI configured with credentials that can create EMR clusters, Glue catalog entries, and access CloudWatch Metrics/Logs
+- Python 3.6+ with `boto3` installed
+- An S3 bucket for test artifacts
+- A VPC subnet with EMR access
+- The sync agent fat JAR built locally: `mvn package assembly:assembly -DskipTests`
+
+### Running via Maven
+
+```bash
+mvn verify -Pload-test \
+  -Dtest.s3.bucket=my-bucket \
+  -Dtest.subnet.id=subnet-abc123 \
+  -Dtest.scenario=burst-create \
+  -Dtest.batch.window.seconds=10
+```
+
+Run multiple scenarios sequentially:
+
+```bash
+mvn verify -Pload-test \
+  -Dtest.s3.bucket=my-bucket \
+  -Dtest.subnet.id=subnet-abc123 \
+  -Dtest.scenario=burst-create,partition-heavy,sustained
+```
+
+| Property | Required | Default | Description |
+|---|---|---|---|
+| `test.s3.bucket` | Yes | — | S3 bucket for artifacts, DDL, and reports |
+| `test.subnet.id` | Yes | — | VPC subnet for the EMR cluster |
+| `test.aws.region` | No | `us-east-1` | AWS region |
+| `test.scenario` | No | `burst-create` | Comma-separated scenario names |
+| `test.batch.window.seconds` | No | `10` | Sync agent batch window in seconds |
+
+### Running standalone
+
+```bash
+export TEST_S3_BUCKET=my-bucket
+export SUBNET_ID=subnet-abc123
+export AWS_REGION=us-east-1
+export SCENARIO=burst-create          # or comma-separated: burst-create,sustained
+export BATCH_WINDOW_SECONDS=10        # optional, default 10
+
+bash integration-tests/load-test/run-load-test.sh
+```
+
+### Running individual scripts
+
+Generate DDL without running the full test:
+
+```bash
+python3 integration-tests/load-test/generate-load.py \
+  --scenario partition-heavy \
+  --output-dir /tmp/ddl \
+  --s3-bucket my-bucket
+```
+
+Run validation against an existing database (after a manual test run):
+
+```bash
+python3 integration-tests/load-test/validate-load.py \
+  --database load_test_db_0 \
+  --region us-east-1 \
+  --scenario burst-create \
+  --expected-tables 100 \
+  --expected-partitions 0
+```
+
+### What happens during a load test run
+
+1. The sync agent fat JAR, bootstrap script, and Spark SQL wrapper are uploaded to S3
+2. `generate-load.py` creates parameterized DDL files for the selected scenario
+3. A CloudFormation stack deploys an EMR cluster with the sync agent installed and metrics enabled
+4. EMR steps execute the Spark SQL DDL, triggering HMS events that the sync agent processes
+5. After a wait period (proportional to the batch window), `validate-load.py` checks:
+   - 100% sync completeness — every expected table and partition exists in the Glue Data Catalog
+   - No CWL errors — no `BLACKLISTED` or `ERROR` entries in the `HIVE_METADATA_SYNC` log group
+   - Sync lag within threshold — average `SyncLagMs` does not exceed 300,000 ms
+6. Each scenario produces a JSON report uploaded to `s3://<bucket>/load-test/reports/<scenario>-report.json`
+7. On exit (pass or fail), cleanup deletes the CloudFormation stack, Glue databases/tables, and S3 test data
+
+### Pass/fail criteria
+
+A scenario passes when all of the following hold:
+
+1. 100% sync completeness — every table and partition created by the DDL exists in the Glue Data Catalog
+2. No CWL errors — no `BLACKLISTED` or `ERROR` entries in CloudWatch Logs
+3. Sync lag within threshold — average `SyncLagMs` ≤ 300,000 ms (configurable via `--sync-lag-threshold-ms`)
+
+The overall load test exits `0` only if every selected scenario passes.
 
 ----
 

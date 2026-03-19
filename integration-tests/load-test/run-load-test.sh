@@ -92,7 +92,7 @@ cleanup() {
     echo "=== Cleanup ==="
 
     # Delete all Glue databases/tables created during load tests
-    for db in "${CREATED_DATABASES[@]}"; do
+    for db in "${CREATED_DATABASES[@]+"${CREATED_DATABASES[@]}"}"; do
         echo "Cleaning up Glue database: ${db}..."
         TABLES=$(aws glue get-tables --database-name "${db}" --region "${REGION}" \
             --query 'TableList[].Name' --output text 2>/dev/null || true)
@@ -163,13 +163,15 @@ fi
 # Deploy using the existing CFN template with modifications:
 # - Override batch window seconds to the configured value
 # - Inject metrics configuration (enabled + namespace)
-MODIFIED_TEMPLATE=$(mktemp /tmp/emr-cfn-XXXXXX.yaml)
+MODIFIED_TEMPLATE=$(mktemp /tmp/emr-cfn.XXXXXXXXXX)
+mv "${MODIFIED_TEMPLATE}" "${MODIFIED_TEMPLATE}.yaml"
+MODIFIED_TEMPLATE="${MODIFIED_TEMPLATE}.yaml"
 sed \
     -e "s|glue.catalog.batch.window.seconds: '10'|glue.catalog.batch.window.seconds: '${BATCH_WINDOW}'|g" \
     "${INTEG_DIR}/cfn/emr-integ-test.yaml" > "${MODIFIED_TEMPLATE}"
 
 # Inject metrics configuration lines after the batch.window.seconds line
-sed -i "/glue.catalog.batch.window.seconds:/a\\
+sed -i '' "/glue.catalog.batch.window.seconds:/a\\
             glue.catalog.metrics.enabled: 'true'\\
             glue.catalog.metrics.namespace: '${METRICS_NAMESPACE}'" \
     "${MODIFIED_TEMPLATE}"
