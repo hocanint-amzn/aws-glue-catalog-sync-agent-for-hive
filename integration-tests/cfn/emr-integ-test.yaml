@@ -217,6 +217,7 @@ Resources:
             glue.catalog.suppressAllDropEvents: 'false'
             glue.catalog.batch.window.seconds: '10'
             glue.catalog.syncTableStatistics: 'false'
+            glue.catalog.metrics.enabled: 'true'
 
         # Conditionally add catalog ID via a separate hive-site classification
         # (AWS::NoValue doesn't work inside ConfigurationProperties maps)

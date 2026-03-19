@@ -4,7 +4,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.services.glue.AWSGlue;
@@ -39,15 +39,15 @@ public class QueueProcessorMetricsPropertyTest {
     // ---- Reflection helpers ----
 
     @SuppressWarnings("unchecked")
-    private ConcurrentLinkedQueue<CatalogOperation> getOperationQueue(HiveGlueCatalogSyncAgent agent) throws Exception {
+    private LinkedBlockingQueue<CatalogOperation> getOperationQueue(HiveGlueCatalogSyncAgent agent) throws Exception {
         Field field = HiveGlueCatalogSyncAgent.class.getDeclaredField("operationQueue");
         field.setAccessible(true);
-        return (ConcurrentLinkedQueue<CatalogOperation>) field.get(agent);
+        return (LinkedBlockingQueue<CatalogOperation>) field.get(agent);
     }
 
     private Object createProcessor(HiveGlueCatalogSyncAgent agent, AWSGlue mockGlue,
             CloudWatchLogsReporter mockCwlr, MetricsCollector metricsCollector,
-            int batchWindowMs, int maxRetryAttempts) throws Exception {
+            int batchWindowMs) throws Exception {
         Class<?> processorClass = Class.forName(
             "com.amazonaws.services.glue.catalog.HiveGlueCatalogSyncAgent$GlueCatalogQueueProcessor");
         Constructor<?> ctor = processorClass.getDeclaredConstructor(
@@ -55,12 +55,12 @@ public class QueueProcessorMetricsPropertyTest {
             AWSGlue.class, CloudWatchLogsReporter.class,
             MetricsCollector.class,
             String.class, boolean.class, boolean.class,
-            int.class, int.class, double.class, int.class);
+            int.class);
         ctor.setAccessible(true);
         return ctor.newInstance(agent, mockGlue, mockCwlr,
             metricsCollector,
             null, false, false,
-            batchWindowMs, 10, 2.0, maxRetryAttempts);
+            batchWindowMs);
     }
 
     private void invokeExecuteOperation(Object processor, CatalogOperation op) throws Exception {
@@ -119,11 +119,11 @@ public class QueueProcessorMetricsPropertyTest {
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
         // Initialize the operationQueue on the agent
-        ConcurrentLinkedQueue<CatalogOperation> queue = getOperationQueue(agent);
+        LinkedBlockingQueue<CatalogOperation> queue = getOperationQueue(agent);
         if (queue == null) {
             Field field = HiveGlueCatalogSyncAgent.class.getDeclaredField("operationQueue");
             field.setAccessible(true);
-            field.set(agent, new ConcurrentLinkedQueue<>());
+            field.set(agent, new LinkedBlockingQueue<>());
             queue = getOperationQueue(agent);
         }
 
@@ -136,7 +136,7 @@ public class QueueProcessorMetricsPropertyTest {
         }
 
         // Create processor with very short batch window (1ms)
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, mockMetrics, 1, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, mockMetrics, 1);
 
         // Run the processor in a background thread so it does at least one drain cycle
         Thread processorThread = new Thread((Runnable) processor);
@@ -194,7 +194,7 @@ public class QueueProcessorMetricsPropertyTest {
         MetricsCollector mockMetrics = mock(MetricsCollector.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, mockMetrics, 100, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, mockMetrics, 100);
 
         // Build an appropriate operation for the type
         CatalogOperation op = buildOperationForType(type);
@@ -232,7 +232,7 @@ public class QueueProcessorMetricsPropertyTest {
         when(mockGlue.updateTable(any(UpdateTableRequest.class))).thenThrow(badRequest);
         when(mockGlue.createDatabase(any(CreateDatabaseRequest.class))).thenThrow(badRequest);
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, mockMetrics, 100, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, mockMetrics, 100);
 
         CatalogOperation op = buildOperationForType(type);
 

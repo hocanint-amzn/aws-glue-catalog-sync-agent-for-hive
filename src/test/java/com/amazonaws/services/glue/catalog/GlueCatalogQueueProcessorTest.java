@@ -40,8 +40,7 @@ public class GlueCatalogQueueProcessorTest {
     // ---- Reflection helpers ----
 
     private Object createProcessor(HiveGlueCatalogSyncAgent agent, AWSGlue mockGlue,
-            CloudWatchLogsReporter mockCwlr, boolean dropTableIfExists, boolean createMissingDB,
-            int maxRetryAttempts) throws Exception {
+            CloudWatchLogsReporter mockCwlr, boolean dropTableIfExists, boolean createMissingDB) throws Exception {
         Class<?> processorClass = Class.forName(
             "com.amazonaws.services.glue.catalog.HiveGlueCatalogSyncAgent$GlueCatalogQueueProcessor");
         Constructor<?> ctor = processorClass.getDeclaredConstructor(
@@ -49,12 +48,12 @@ public class GlueCatalogQueueProcessorTest {
             AWSGlue.class, CloudWatchLogsReporter.class,
             MetricsCollector.class,
             String.class, boolean.class, boolean.class,
-            int.class, int.class, double.class, int.class);
+            int.class);
         ctor.setAccessible(true);
         return ctor.newInstance(agent, mockGlue, mockCwlr,
             new NoOpMetricsCollector(),
             null, dropTableIfExists, createMissingDB,
-            100, 10, 2.0, maxRetryAttempts);
+            100);
     }
 
     private void invokeExecuteOperation(Object processor, CatalogOperation op) throws Exception {
@@ -96,7 +95,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, true, false, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, true, false);
 
         // First createTable call throws AlreadyExistsException; second succeeds
         when(mockGlue.createTable(any(CreateTableRequest.class)))
@@ -134,7 +133,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false);
 
         when(mockGlue.createTable(any(CreateTableRequest.class)))
             .thenThrow(new AlreadyExistsException("Table already exists"));
@@ -171,7 +170,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, true, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, true);
 
         // First createTable throws EntityNotFoundException (database not found); second succeeds
         EntityNotFoundException enfe = new EntityNotFoundException("database not found");
@@ -210,7 +209,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false);
 
         when(mockGlue.deleteTable(any(DeleteTableRequest.class)))
             .thenThrow(new EntityNotFoundException("Table not found"));
@@ -232,28 +231,27 @@ public class GlueCatalogQueueProcessorTest {
         assertFalse("CWL should NOT contain an error message", hasError);
     }
 
-    // ---- Test 5: Transient error retry with exponential backoff ----
+    // ---- Test 5: Transient error is surfaced after SDK retries are exhausted ----
 
     /**
      * Validates: Requirement 11.2
-     * IF a GDC API call fails with a transient error (429), THEN the processor
-     * retries with exponential backoff.
+     * Transient error retries (429, 500, 503) are now handled by the SDK's built-in
+     * retry policy. If the SDK exhausts its retries, the exception propagates to the
+     * processor which logs the failure.
      */
     @Test
-    public void testTransientErrorRetryWithBackoff() throws Exception {
+    public void testTransientErrorSurfacedAfterSdkRetries() throws Exception {
         AWSGlue mockGlue = mock(AWSGlue.class);
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        // maxRetryAttempts=3, initialBackoffMs=10 (small for test speed)
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false, 3);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false);
 
-        // First call throws transient 429, second succeeds
+        // Simulate SDK having exhausted its retries and throwing the exception
         AmazonServiceException throttle = new AmazonServiceException("Rate exceeded");
         throttle.setStatusCode(429);
         when(mockGlue.createTable(any(CreateTableRequest.class)))
-            .thenThrow(throttle)
-            .thenReturn(null);
+            .thenThrow(throttle);
 
         CatalogOperation op = new CatalogOperation(
             CatalogOperation.OperationType.CREATE_TABLE, "mydb", "mytable",
@@ -261,14 +259,14 @@ public class GlueCatalogQueueProcessorTest {
 
         invokeExecuteOperation(processor, op);
 
-        // createTable should have been called twice (initial fail + successful retry)
-        verify(mockGlue, times(2)).createTable(any(CreateTableRequest.class));
-        // CWL should report success
+        // createTable should have been called exactly once (SDK handles retries internally)
+        verify(mockGlue, times(1)).createTable(any(CreateTableRequest.class));
+        // CWL should report error
         ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
         verify(mockCwlr, atLeastOnce()).sendToCWL(captor.capture());
-        boolean hasSuccess = captor.getAllValues().stream()
-            .anyMatch(msg -> msg.contains("SUCCESS") && msg.contains("mydb.mytable"));
-        assertTrue("CWL should contain a success message after retry", hasSuccess);
+        boolean hasError = captor.getAllValues().stream()
+            .anyMatch(msg -> msg.contains("ERROR") && msg.contains("mydb.mytable"));
+        assertTrue("CWL should contain an error message after SDK retries exhausted", hasError);
     }
 
     // ---- Test 6: Non-transient error ----
@@ -284,7 +282,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false);
 
         AmazonServiceException badRequest = new AmazonServiceException("Invalid input");
         badRequest.setStatusCode(400);
@@ -320,7 +318,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false);
 
         when(mockGlue.batchCreatePartition(any(BatchCreatePartitionRequest.class)))
             .thenThrow(new EntityNotFoundException("Table not found"));
@@ -366,7 +364,7 @@ public class GlueCatalogQueueProcessorTest {
         CloudWatchLogsReporter mockCwlr = mock(CloudWatchLogsReporter.class);
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
 
-        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false, 0);
+        Object processor = createProcessor(agent, mockGlue, mockCwlr, false, false);
 
         when(mockGlue.batchDeletePartition(any(BatchDeletePartitionRequest.class)))
             .thenThrow(new EntityNotFoundException("Table not found"));

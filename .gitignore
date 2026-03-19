@@ -8,3 +8,4 @@ src/main/.DS_Store
 src/main/.DS_Store
 .hypothesis/
 .jqwik-database
+.pytest_cache

@@ -44,9 +44,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private static final String GLUE_CATALOG_ID = "glue.catalog.id";
 	private static final String GLUE_CATALOG_BATCH_WINDOW_SECONDS = "glue.catalog.batch.window.seconds";
 	private static final String GLUE_CATALOG_SYNC_TABLE_STATISTICS = "glue.catalog.syncTableStatistics";
-	private static final String GLUE_CATALOG_RETRY_INITIAL_BACKOFF_MS = "glue.catalog.retry.initialBackoffMs";
-	private static final String GLUE_CATALOG_RETRY_BACKOFF_MULTIPLIER = "glue.catalog.retry.backoffMultiplier";
-	private static final String GLUE_CATALOG_RETRY_MAX_ATTEMPTS = "glue.catalog.retry.maxAttempts";
 	private static final String GLUE_CATALOG_QUEUE_CAPACITY = "glue.catalog.queue.capacity";
 	private static final int DEFAULT_QUEUE_CAPACITY = 50000;
 
@@ -72,9 +69,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private String catalogId;
 	private boolean syncTableStatistics = false;
 	private int batchWindowSeconds = 60;
-	private int retryInitialBackoffMs = 1000;
-	private double retryBackoffMultiplier = 2.0;
-	private int retryMaxAttempts = 5;
 	private final Set<String> blacklistedTables = ConcurrentHashMap.newKeySet();
 	private MetricsCollector metricsCollector;
 
@@ -104,6 +98,10 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	/**
 	 * Queue processor that drains CatalogOperations from the queue in batch windows
 	 * and executes them against the AWS Glue Data Catalog API directly.
+	 *
+	 * Transient error retries (429, 500, 503) are handled by the SDK's built-in
+	 * retry policy configured in {@link GlueClientFactory}. This class only handles
+	 * domain-specific exception recovery (AlreadyExistsException, EntityNotFoundException).
 	 */
 	final class GlueCatalogQueueProcessor implements Runnable {
 		private final AWSGlue glueClient;
@@ -113,15 +111,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		private final boolean dropTableIfExists;
 		private final boolean createMissingDB;
 		private final int batchWindowMs;
-		private final int initialBackoffMs;
-		private final double backoffMultiplier;
-		private final int maxRetryAttempts;
 		private volatile boolean running = true;
 
 		GlueCatalogQueueProcessor(AWSGlue glueClient, CloudWatchLogsReporter cwlr,
 				MetricsCollector metricsCollector,
 				String catalogId, boolean dropTableIfExists, boolean createMissingDB,
-				int batchWindowMs, int initialBackoffMs, double backoffMultiplier, int maxRetryAttempts) {
+				int batchWindowMs) {
 			this.glueClient = glueClient;
 			this.cwlr = cwlr;
 			this.metricsCollector = metricsCollector;
@@ -129,9 +124,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			this.dropTableIfExists = dropTableIfExists;
 			this.createMissingDB = createMissingDB;
 			this.batchWindowMs = batchWindowMs;
-			this.initialBackoffMs = initialBackoffMs;
-			this.backoffMultiplier = backoffMultiplier;
-			this.maxRetryAttempts = maxRetryAttempts;
 		}
 
 		public void stop() {
@@ -242,121 +234,86 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				request.withCatalogId(catalogId);
 			}
 
-			for (int attempt = 0; attempt <= maxRetryAttempts; attempt++) {
-				try {
-					glueClient.createTable(request);
-					cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName());
-					LOG.info("Successfully created table {}", op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
-					return;
-				} catch (AlreadyExistsException e) {
-					if (dropTableIfExists) {
-						LOG.info("Table {} already exists, dropping and retrying", op.getFullTableName());
-						cwlr.sendToCWL("INFO: CREATE_TABLE " + op.getFullTableName()
-								+ " already exists, dropping and retrying");
-						try {
-							DeleteTableRequest deleteRequest = new DeleteTableRequest()
-									.withDatabaseName(op.getDatabaseName())
-									.withName(op.getTableName());
-							if (catalogId != null) {
-								deleteRequest.withCatalogId(catalogId);
-							}
-							glueClient.deleteTable(deleteRequest);
-							// Retry the create
-							glueClient.createTable(request);
-							cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
-									+ " (after drop+retry)");
-							LOG.info("Successfully created table {} after drop+retry", op.getFullTableName());
-							metricsCollector.recordOperationSuccess(op.getType());
-							return;
-						} catch (Exception retryEx) {
-							cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
-									+ " drop+retry failed: " + retryEx.getMessage());
-							LOG.error("Failed to drop+retry create table {}: {}",
-									op.getFullTableName(), retryEx.getMessage());
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
+			try {
+				glueClient.createTable(request);
+				cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName());
+				LOG.info("Successfully created table {}", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AlreadyExistsException e) {
+				if (dropTableIfExists) {
+					LOG.info("Table {} already exists, dropping and retrying", op.getFullTableName());
+					cwlr.sendToCWL("INFO: CREATE_TABLE " + op.getFullTableName()
+							+ " already exists, dropping and retrying");
+					try {
+						DeleteTableRequest deleteRequest = new DeleteTableRequest()
+								.withDatabaseName(op.getDatabaseName())
+								.withName(op.getTableName());
+						if (catalogId != null) {
+							deleteRequest.withCatalogId(catalogId);
 						}
-					} else {
-						addToBlacklist(op.getDatabaseName(), op.getTableName());
-						cwlr.sendToCWL("BLACKLISTED: CREATE_TABLE " + op.getFullTableName()
-								+ " already exists and dropTableIfExists is disabled");
-						LOG.warn("Table {} already exists and dropTableIfExists is disabled, blacklisting",
-								op.getFullTableName());
-						metricsCollector.recordOperationFailure(op.getType());
-						return;
-					}
-				} catch (EntityNotFoundException e) {
-					if (createMissingDB && e.getMessage() != null
-							&& e.getMessage().toLowerCase().contains("database")) {
-						LOG.info("Database {} not found for table {}, creating database and retrying",
-								op.getDatabaseName(), op.getFullTableName());
-						cwlr.sendToCWL("INFO: CREATE_TABLE " + op.getFullTableName()
-								+ " database not found, creating database and retrying");
-						try {
-							DatabaseInput dbInput = new DatabaseInput()
-									.withName(op.getDatabaseName());
-							CreateDatabaseRequest dbRequest = new CreateDatabaseRequest()
-									.withDatabaseInput(dbInput);
-							if (catalogId != null) {
-								dbRequest.withCatalogId(catalogId);
-							}
-							glueClient.createDatabase(dbRequest);
-							// Retry the create table
-							glueClient.createTable(request);
-							cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
-									+ " (after createDatabase+retry)");
-							LOG.info("Successfully created table {} after creating database {}",
-									op.getFullTableName(), op.getDatabaseName());
-							metricsCollector.recordOperationSuccess(op.getType());
-							return;
-						} catch (Exception retryEx) {
-							cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
-									+ " createDatabase+retry failed: " + retryEx.getMessage());
-							LOG.error("Failed to createDatabase+retry for table {}: {}",
-									op.getFullTableName(), retryEx.getMessage());
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
+						glueClient.deleteTable(deleteRequest);
+						glueClient.createTable(request);
+						cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
+								+ " (after drop+retry)");
+						LOG.info("Successfully created table {} after drop+retry", op.getFullTableName());
+						metricsCollector.recordOperationSuccess(op.getType());
+					} catch (Exception retryEx) {
 						cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
-								+ " EntityNotFoundException: " + e.getMessage());
-						LOG.error("EntityNotFoundException creating table {}: {}",
-								op.getFullTableName(), e.getMessage());
+								+ " drop+retry failed: " + retryEx.getMessage());
+						LOG.error("Failed to drop+retry create table {}: {}",
+								op.getFullTableName(), retryEx.getMessage());
 						metricsCollector.recordOperationFailure(op.getType());
-						return;
 					}
-				} catch (AmazonServiceException e) {
-					if (isTransientError(e) && attempt < maxRetryAttempts) {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
-						LOG.warn("Transient error creating table {} (attempt {}/{}), retrying in {}ms: {}",
-								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
-						try {
-							Thread.sleep(backoff);
-						} catch (InterruptedException ie) {
-							Thread.currentThread().interrupt();
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
-								+ " failed: " + e.getMessage());
-						LOG.error("Failed to create table {}: {}", op.getFullTableName(), e.getMessage());
-						metricsCollector.recordOperationFailure(op.getType());
-						metricsCollector.recordRetryCount(op.getType(), attempt);
-						return;
-					}
+				} else {
+					addToBlacklist(op.getDatabaseName(), op.getTableName());
+					cwlr.sendToCWL("BLACKLISTED: CREATE_TABLE " + op.getFullTableName()
+							+ " already exists and dropTableIfExists is disabled");
+					LOG.warn("Table {} already exists and dropTableIfExists is disabled, blacklisting",
+							op.getFullTableName());
+					metricsCollector.recordOperationFailure(op.getType());
 				}
+			} catch (EntityNotFoundException e) {
+				if (createMissingDB && e.getMessage() != null
+						&& e.getMessage().toLowerCase().contains("database")) {
+					LOG.info("Database {} not found for table {}, creating database and retrying",
+							op.getDatabaseName(), op.getFullTableName());
+					cwlr.sendToCWL("INFO: CREATE_TABLE " + op.getFullTableName()
+							+ " database not found, creating database and retrying");
+					try {
+						DatabaseInput dbInput = new DatabaseInput()
+								.withName(op.getDatabaseName());
+						CreateDatabaseRequest dbRequest = new CreateDatabaseRequest()
+								.withDatabaseInput(dbInput);
+						if (catalogId != null) {
+							dbRequest.withCatalogId(catalogId);
+						}
+						glueClient.createDatabase(dbRequest);
+						glueClient.createTable(request);
+						cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
+								+ " (after createDatabase+retry)");
+						LOG.info("Successfully created table {} after creating database {}",
+								op.getFullTableName(), op.getDatabaseName());
+						metricsCollector.recordOperationSuccess(op.getType());
+					} catch (Exception retryEx) {
+						cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+								+ " createDatabase+retry failed: " + retryEx.getMessage());
+						LOG.error("Failed to createDatabase+retry for table {}: {}",
+								op.getFullTableName(), retryEx.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+					}
+				} else {
+					cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+							+ " EntityNotFoundException: " + e.getMessage());
+					LOG.error("EntityNotFoundException creating table {}: {}",
+							op.getFullTableName(), e.getMessage());
+					metricsCollector.recordOperationFailure(op.getType());
+				}
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to create table {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
-			// Exhausted retries
-			cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
-					+ " failed after " + maxRetryAttempts + " retries");
-			LOG.error("Exhausted retries for CREATE_TABLE {}", op.getFullTableName());
-			metricsCollector.recordOperationFailure(op.getType());
-			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		private void executeDropTable(CatalogOperation op) {
@@ -367,49 +324,22 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				request.withCatalogId(catalogId);
 			}
 
-			for (int attempt = 0; attempt <= maxRetryAttempts; attempt++) {
-				try {
-					glueClient.deleteTable(request);
-					cwlr.sendToCWL("SUCCESS: DROP_TABLE " + op.getFullTableName());
-					LOG.info("Successfully dropped table {}", op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
-					return;
-				} catch (EntityNotFoundException e) {
-					cwlr.sendToCWL("INFO: DROP_TABLE " + op.getFullTableName()
-							+ " not found in GDC, skipping");
-					LOG.warn("Table {} not found in GDC during drop, skipping", op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					return;
-				} catch (AmazonServiceException e) {
-					if (isTransientError(e) && attempt < maxRetryAttempts) {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
-						LOG.warn("Transient error dropping table {} (attempt {}/{}), retrying in {}ms: {}",
-								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
-						try {
-							Thread.sleep(backoff);
-						} catch (InterruptedException ie) {
-							Thread.currentThread().interrupt();
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						cwlr.sendToCWL("ERROR: DROP_TABLE " + op.getFullTableName()
-								+ " failed: " + e.getMessage());
-						LOG.error("Failed to drop table {}: {}", op.getFullTableName(), e.getMessage());
-						metricsCollector.recordOperationFailure(op.getType());
-						metricsCollector.recordRetryCount(op.getType(), attempt);
-						return;
-					}
-				}
+			try {
+				glueClient.deleteTable(request);
+				cwlr.sendToCWL("SUCCESS: DROP_TABLE " + op.getFullTableName());
+				LOG.info("Successfully dropped table {}", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (EntityNotFoundException e) {
+				cwlr.sendToCWL("INFO: DROP_TABLE " + op.getFullTableName()
+						+ " not found in GDC, skipping");
+				LOG.warn("Table {} not found in GDC during drop, skipping", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: DROP_TABLE " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to drop table {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
-			cwlr.sendToCWL("ERROR: DROP_TABLE " + op.getFullTableName()
-					+ " failed after " + maxRetryAttempts + " retries");
-			LOG.error("Exhausted retries for DROP_TABLE {}", op.getFullTableName());
-			metricsCollector.recordOperationFailure(op.getType());
-			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		@SuppressWarnings("unchecked")
@@ -423,50 +353,23 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				request.withCatalogId(catalogId);
 			}
 
-			for (int attempt = 0; attempt <= maxRetryAttempts; attempt++) {
-				try {
-					glueClient.batchCreatePartition(request);
-					cwlr.sendToCWL("SUCCESS: ADD_PARTITIONS " + op.getFullTableName()
-							+ " (" + partitions.size() + " partitions)");
-					LOG.info("Successfully added {} partitions to {}", partitions.size(), op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
-					return;
-				} catch (EntityNotFoundException e) {
-					cwlr.sendToCWL("INFO: ADD_PARTITIONS " + op.getFullTableName()
-							+ " table not found in GDC, skipping");
-					LOG.warn("Table {} not found in GDC during addPartitions, skipping", op.getFullTableName());
-					metricsCollector.recordOperationFailure(op.getType());
-					return;
-				} catch (AmazonServiceException e) {
-					if (isTransientError(e) && attempt < maxRetryAttempts) {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
-						LOG.warn("Transient error adding partitions to {} (attempt {}/{}), retrying in {}ms: {}",
-								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
-						try {
-							Thread.sleep(backoff);
-						} catch (InterruptedException ie) {
-							Thread.currentThread().interrupt();
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						cwlr.sendToCWL("ERROR: ADD_PARTITIONS " + op.getFullTableName()
-								+ " failed: " + e.getMessage());
-						LOG.error("Failed to add partitions to {}: {}", op.getFullTableName(), e.getMessage());
-						metricsCollector.recordOperationFailure(op.getType());
-						metricsCollector.recordRetryCount(op.getType(), attempt);
-						return;
-					}
-				}
+			try {
+				glueClient.batchCreatePartition(request);
+				cwlr.sendToCWL("SUCCESS: ADD_PARTITIONS " + op.getFullTableName()
+						+ " (" + partitions.size() + " partitions)");
+				LOG.info("Successfully added {} partitions to {}", partitions.size(), op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (EntityNotFoundException e) {
+				cwlr.sendToCWL("INFO: ADD_PARTITIONS " + op.getFullTableName()
+						+ " table not found in GDC, skipping");
+				LOG.warn("Table {} not found in GDC during addPartitions, skipping", op.getFullTableName());
+				metricsCollector.recordOperationFailure(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: ADD_PARTITIONS " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to add partitions to {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
-			cwlr.sendToCWL("ERROR: ADD_PARTITIONS " + op.getFullTableName()
-					+ " failed after " + maxRetryAttempts + " retries");
-			LOG.error("Exhausted retries for ADD_PARTITIONS {}", op.getFullTableName());
-			metricsCollector.recordOperationFailure(op.getType());
-			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		@SuppressWarnings("unchecked")
@@ -480,51 +383,24 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				request.withCatalogId(catalogId);
 			}
 
-			for (int attempt = 0; attempt <= maxRetryAttempts; attempt++) {
-				try {
-					glueClient.batchDeletePartition(request);
-					cwlr.sendToCWL("SUCCESS: DROP_PARTITIONS " + op.getFullTableName()
-							+ " (" + partitionValues.size() + " partitions)");
-					LOG.info("Successfully dropped {} partitions from {}", partitionValues.size(),
-							op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
-					return;
-				} catch (EntityNotFoundException e) {
-					cwlr.sendToCWL("INFO: DROP_PARTITIONS " + op.getFullTableName()
-							+ " table not found in GDC, skipping");
-					LOG.warn("Table {} not found in GDC during dropPartitions, skipping", op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					return;
-				} catch (AmazonServiceException e) {
-					if (isTransientError(e) && attempt < maxRetryAttempts) {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
-						LOG.warn("Transient error dropping partitions from {} (attempt {}/{}), retrying in {}ms: {}",
-								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
-						try {
-							Thread.sleep(backoff);
-						} catch (InterruptedException ie) {
-							Thread.currentThread().interrupt();
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						cwlr.sendToCWL("ERROR: DROP_PARTITIONS " + op.getFullTableName()
-								+ " failed: " + e.getMessage());
-						LOG.error("Failed to drop partitions from {}: {}", op.getFullTableName(), e.getMessage());
-						metricsCollector.recordOperationFailure(op.getType());
-						metricsCollector.recordRetryCount(op.getType(), attempt);
-						return;
-					}
-				}
+			try {
+				glueClient.batchDeletePartition(request);
+				cwlr.sendToCWL("SUCCESS: DROP_PARTITIONS " + op.getFullTableName()
+						+ " (" + partitionValues.size() + " partitions)");
+				LOG.info("Successfully dropped {} partitions from {}", partitionValues.size(),
+						op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (EntityNotFoundException e) {
+				cwlr.sendToCWL("INFO: DROP_PARTITIONS " + op.getFullTableName()
+						+ " table not found in GDC, skipping");
+				LOG.warn("Table {} not found in GDC during dropPartitions, skipping", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: DROP_PARTITIONS " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to drop partitions from {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
-			cwlr.sendToCWL("ERROR: DROP_PARTITIONS " + op.getFullTableName()
-					+ " failed after " + maxRetryAttempts + " retries");
-			LOG.error("Exhausted retries for DROP_PARTITIONS {}", op.getFullTableName());
-			metricsCollector.recordOperationFailure(op.getType());
-			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		private void executeUpdateTable(CatalogOperation op) {
@@ -536,43 +412,17 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				request.withCatalogId(catalogId);
 			}
 
-			for (int attempt = 0; attempt <= maxRetryAttempts; attempt++) {
-				try {
-					glueClient.updateTable(request);
-					cwlr.sendToCWL("SUCCESS: UPDATE_TABLE " + op.getFullTableName());
-					LOG.info("Successfully updated table {}", op.getFullTableName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
-					return;
-				} catch (AmazonServiceException e) {
-					if (isTransientError(e) && attempt < maxRetryAttempts) {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
-						LOG.warn("Transient error updating table {} (attempt {}/{}), retrying in {}ms: {}",
-								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
-						try {
-							Thread.sleep(backoff);
-						} catch (InterruptedException ie) {
-							Thread.currentThread().interrupt();
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						cwlr.sendToCWL("ERROR: UPDATE_TABLE " + op.getFullTableName()
-								+ " failed: " + e.getMessage());
-						LOG.error("Failed to update table {}: {}", op.getFullTableName(), e.getMessage());
-						metricsCollector.recordOperationFailure(op.getType());
-						metricsCollector.recordRetryCount(op.getType(), attempt);
-						return;
-					}
-				}
+			try {
+				glueClient.updateTable(request);
+				cwlr.sendToCWL("SUCCESS: UPDATE_TABLE " + op.getFullTableName());
+				LOG.info("Successfully updated table {}", op.getFullTableName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: UPDATE_TABLE " + op.getFullTableName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to update table {}: {}", op.getFullTableName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
-			cwlr.sendToCWL("ERROR: UPDATE_TABLE " + op.getFullTableName()
-					+ " failed after " + maxRetryAttempts + " retries");
-			LOG.error("Exhausted retries for UPDATE_TABLE {}", op.getFullTableName());
-			metricsCollector.recordOperationFailure(op.getType());
-			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		private void executeCreateDatabase(CatalogOperation op) {
@@ -583,54 +433,22 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				request.withCatalogId(catalogId);
 			}
 
-			for (int attempt = 0; attempt <= maxRetryAttempts; attempt++) {
-				try {
-					glueClient.createDatabase(request);
-					cwlr.sendToCWL("SUCCESS: CREATE_DATABASE " + op.getDatabaseName());
-					LOG.info("Successfully created database {}", op.getDatabaseName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
-					return;
-				} catch (AlreadyExistsException e) {
-					cwlr.sendToCWL("INFO: CREATE_DATABASE " + op.getDatabaseName()
-							+ " already exists, skipping");
-					LOG.info("Database {} already exists, skipping creation", op.getDatabaseName());
-					metricsCollector.recordOperationSuccess(op.getType());
-					return;
-				} catch (AmazonServiceException e) {
-					if (isTransientError(e) && attempt < maxRetryAttempts) {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
-						LOG.warn("Transient error creating database {} (attempt {}/{}), retrying in {}ms: {}",
-								op.getDatabaseName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
-						try {
-							Thread.sleep(backoff);
-						} catch (InterruptedException ie) {
-							Thread.currentThread().interrupt();
-							metricsCollector.recordOperationFailure(op.getType());
-							return;
-						}
-					} else {
-						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
-						cwlr.sendToCWL("ERROR: CREATE_DATABASE " + op.getDatabaseName()
-								+ " failed: " + e.getMessage());
-						LOG.error("Failed to create database {}: {}", op.getDatabaseName(), e.getMessage());
-						metricsCollector.recordOperationFailure(op.getType());
-						metricsCollector.recordRetryCount(op.getType(), attempt);
-						return;
-					}
-				}
+			try {
+				glueClient.createDatabase(request);
+				cwlr.sendToCWL("SUCCESS: CREATE_DATABASE " + op.getDatabaseName());
+				LOG.info("Successfully created database {}", op.getDatabaseName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AlreadyExistsException e) {
+				cwlr.sendToCWL("INFO: CREATE_DATABASE " + op.getDatabaseName()
+						+ " already exists, skipping");
+				LOG.info("Database {} already exists, skipping creation", op.getDatabaseName());
+				metricsCollector.recordOperationSuccess(op.getType());
+			} catch (AmazonServiceException e) {
+				cwlr.sendToCWL("ERROR: CREATE_DATABASE " + op.getDatabaseName()
+						+ " failed: " + e.getMessage());
+				LOG.error("Failed to create database {}: {}", op.getDatabaseName(), e.getMessage());
+				metricsCollector.recordOperationFailure(op.getType());
 			}
-			cwlr.sendToCWL("ERROR: CREATE_DATABASE " + op.getDatabaseName()
-					+ " failed after " + maxRetryAttempts + " retries");
-			LOG.error("Exhausted retries for CREATE_DATABASE {}", op.getDatabaseName());
-			metricsCollector.recordOperationFailure(op.getType());
-			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
-		}
-
-		boolean isTransientError(AmazonServiceException e) {
-			int statusCode = e.getStatusCode();
-			return statusCode == 429 || statusCode == 500 || statusCode == 503;
 		}
 	}
 
@@ -665,12 +483,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		this.catalogId = config.get(GLUE_CATALOG_ID, null);
 		this.syncTableStatistics = config.getBoolean(GLUE_CATALOG_SYNC_TABLE_STATISTICS, false);
 		this.batchWindowSeconds = config.getInt(GLUE_CATALOG_BATCH_WINDOW_SECONDS, 60);
-		this.retryInitialBackoffMs = config.getInt(GLUE_CATALOG_RETRY_INITIAL_BACKOFF_MS, 1000);
-		this.retryBackoffMultiplier = Double.parseDouble(
-				config.get(GLUE_CATALOG_RETRY_BACKOFF_MULTIPLIER, "2.0"));
-		this.retryMaxAttempts = config.getInt(GLUE_CATALOG_RETRY_MAX_ATTEMPTS, 5);
 
-		// Create Glue client
+		// Create Glue client (retry policy for transient errors is configured in GlueClientFactory)
 		this.glueClient = GlueClientFactory.createClient(config);
 
 		operationQueue = new LinkedBlockingQueue<>(
@@ -681,8 +495,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		this.metricsCollector = MetricsCollectorFactory.create(config);
 		GlueCatalogQueueProcessor glueCatalogQueueProcessor = new GlueCatalogQueueProcessor(
 				this.glueClient, cwlr, metricsCollector, this.catalogId, this.dropTableIfExists, this.createMissingDB,
-				this.batchWindowSeconds * 1000, this.retryInitialBackoffMs,
-				this.retryBackoffMultiplier, this.retryMaxAttempts);
+				this.batchWindowSeconds * 1000);
 		queueProcessor = new Thread(glueCatalogQueueProcessor, "GlueCatalogSyncThread");
 		queueProcessor.start();
 

@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import com.amazonaws.services.glue.model.PartitionInput;
 import com.amazonaws.services.glue.model.PartitionValueList;
@@ -111,15 +111,15 @@ public class EventHandlerPropertyTest {
     /**
      * Helper to access the operationQueue field via reflection for test verification.
      */
-    private ConcurrentLinkedQueue<CatalogOperation> getQueue(HiveGlueCatalogSyncAgent agent) {
+    private LinkedBlockingQueue<CatalogOperation> getQueue(HiveGlueCatalogSyncAgent agent) {
         try {
             java.lang.reflect.Field field = HiveGlueCatalogSyncAgent.class.getDeclaredField("operationQueue");
             field.setAccessible(true);
             @SuppressWarnings("unchecked")
-            ConcurrentLinkedQueue<CatalogOperation> queue =
-                (ConcurrentLinkedQueue<CatalogOperation>) field.get(agent);
+            LinkedBlockingQueue<CatalogOperation> queue =
+                (LinkedBlockingQueue<CatalogOperation>) field.get(agent);
             if (queue == null) {
-                queue = new ConcurrentLinkedQueue<>();
+                queue = new LinkedBlockingQueue<>();
                 field.set(agent, queue);
             }
             return queue;
@@ -398,7 +398,7 @@ public class EventHandlerPropertyTest {
             @ForAll("identifiers") String tableName) {
 
         HiveGlueCatalogSyncAgent agent = createAgent();
-        ConcurrentLinkedQueue<CatalogOperation> queue = getQueue(agent);
+        LinkedBlockingQueue<CatalogOperation> queue = getQueue(agent);
 
         agent.addToBlacklist(dbName, tableName);
 
@@ -436,7 +436,7 @@ public class EventHandlerPropertyTest {
             @ForAll("s3Locations") String location) {
 
         HiveGlueCatalogSyncAgent agent = createAgent();
-        ConcurrentLinkedQueue<CatalogOperation> queue = getQueue(agent);
+        LinkedBlockingQueue<CatalogOperation> queue = getQueue(agent);
         setSuppressAllDropEvents(agent, true);
 
         Table table = buildTable(dbName, tableName, location, new HashMap<String, String>());
@@ -467,7 +467,7 @@ public class EventHandlerPropertyTest {
             @ForAll("s3Locations") String location) {
 
         HiveGlueCatalogSyncAgent agent = createAgent();
-        ConcurrentLinkedQueue<CatalogOperation> queue = getQueue(agent);
+        LinkedBlockingQueue<CatalogOperation> queue = getQueue(agent);
         setSuppressAllDropEvents(agent, false);
 
         Table table = buildTable(dbName, tableName, location, new HashMap<String, String>());
@@ -507,7 +507,7 @@ public class EventHandlerPropertyTest {
             @ForAll("identifiers") String tableName) {
 
         HiveGlueCatalogSyncAgent agent = createAgent();
-        ConcurrentLinkedQueue<CatalogOperation> queue = getQueue(agent);
+        LinkedBlockingQueue<CatalogOperation> queue = getQueue(agent);
         setSuppressAllDropEvents(agent, suppress);
 
         Table table = buildTable(dbName, tableName, "s3://bucket/data", new HashMap<String, String>());
