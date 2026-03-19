@@ -138,11 +138,11 @@ public class CWLPropertyTest {
         HiveGlueCatalogSyncAgent agent = new HiveGlueCatalogSyncAgent();
         Class<?> processorClass = Class.forName(
             "com.amazonaws.services.glue.catalog.HiveGlueCatalogSyncAgent$GlueCatalogQueueProcessor");
-        // Constructor: (HiveGlueCatalogSyncAgent, AWSGlue, CloudWatchLogsReporter, String, boolean, boolean, int, int, double, int)
         java.lang.reflect.Constructor<?> ctor = processorClass.getDeclaredConstructor(
             HiveGlueCatalogSyncAgent.class,
             AWSGlue.class,
             CloudWatchLogsReporter.class,
+            MetricsCollector.class,
             String.class,
             boolean.class,
             boolean.class,
@@ -152,7 +152,7 @@ public class CWLPropertyTest {
             int.class
         );
         ctor.setAccessible(true);
-        return ctor.newInstance(agent, mockGlue, mockCwlr, null, false, false, 100, 10, 2.0, 0);
+        return ctor.newInstance(agent, mockGlue, mockCwlr, new NoOpMetricsCollector(), null, false, false, 100, 10, 2.0, 0);
     }
 
     /**

@@ -75,14 +75,18 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	 */
 	private final class SyncAgentShutdownRoutine implements Runnable {
 		private GlueCatalogQueueProcessor p;
+		private MetricsCollector metricsCollector;
 
-		protected SyncAgentShutdownRoutine(GlueCatalogQueueProcessor queueProcessor) {
+		protected SyncAgentShutdownRoutine(GlueCatalogQueueProcessor queueProcessor, MetricsCollector metricsCollector) {
 			this.p = queueProcessor;
+			this.metricsCollector = metricsCollector;
 		}
 
 		public void run() {
 			// stop the queue processing thread
 			p.stop();
+			// shutdown metrics collector (flushes remaining metrics)
+			metricsCollector.shutdown();
 		}
 	}
 
@@ -93,6 +97,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	final class GlueCatalogQueueProcessor implements Runnable {
 		private final AWSGlue glueClient;
 		private final CloudWatchLogsReporter cwlr;
+		private final MetricsCollector metricsCollector;
 		private final String catalogId;
 		private final boolean dropTableIfExists;
 		private final boolean createMissingDB;
@@ -103,10 +108,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		private volatile boolean running = true;
 
 		GlueCatalogQueueProcessor(AWSGlue glueClient, CloudWatchLogsReporter cwlr,
+				MetricsCollector metricsCollector,
 				String catalogId, boolean dropTableIfExists, boolean createMissingDB,
 				int batchWindowMs, int initialBackoffMs, double backoffMultiplier, int maxRetryAttempts) {
 			this.glueClient = glueClient;
 			this.cwlr = cwlr;
+			this.metricsCollector = metricsCollector;
 			this.catalogId = catalogId;
 			this.dropTableIfExists = dropTableIfExists;
 			this.createMissingDB = createMissingDB;
@@ -134,6 +141,9 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					}
 				}
 
+				// Record queue depth before draining
+				metricsCollector.recordQueueDepth(operationQueue.size());
+
 				// Drain all operations from the queue
 				List<CatalogOperation> batch = new ArrayList<>();
 				CatalogOperation op;
@@ -142,7 +152,10 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				}
 
 				if (!batch.isEmpty()) {
+					metricsCollector.recordBatchSize(batch.size());
+					long batchStart = System.currentTimeMillis();
 					processBatch(batch);
+					metricsCollector.recordBatchProcessingTimeMs(System.currentTimeMillis() - batchStart);
 				}
 			}
 			LOG.info("GlueCatalogQueueProcessor stopped");
@@ -200,6 +213,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 				default:
 					LOG.warn("Unknown operation type: {}", op.getType());
 			}
+			// Record sync lag from enqueue to completion
+			metricsCollector.recordSyncLagMs(System.currentTimeMillis() - op.getCreatedAtMillis());
 		}
 
 		private void executeCreateTable(CatalogOperation op) {
@@ -216,6 +231,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					glueClient.createTable(request);
 					cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName());
 					LOG.info("Successfully created table {}", op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
+					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
 					return;
 				} catch (AlreadyExistsException e) {
 					if (dropTableIfExists) {
@@ -235,12 +252,14 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							cwlr.sendToCWL("SUCCESS: CREATE_TABLE " + op.getFullTableName()
 									+ " (after drop+retry)");
 							LOG.info("Successfully created table {} after drop+retry", op.getFullTableName());
+							metricsCollector.recordOperationSuccess(op.getType());
 							return;
 						} catch (Exception retryEx) {
 							cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
 									+ " drop+retry failed: " + retryEx.getMessage());
 							LOG.error("Failed to drop+retry create table {}: {}",
 									op.getFullTableName(), retryEx.getMessage());
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
@@ -249,6 +268,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 								+ " already exists and dropTableIfExists is disabled");
 						LOG.warn("Table {} already exists and dropTableIfExists is disabled, blacklisting",
 								op.getFullTableName());
+						metricsCollector.recordOperationFailure(op.getType());
 						return;
 					}
 				} catch (EntityNotFoundException e) {
@@ -273,12 +293,14 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 									+ " (after createDatabase+retry)");
 							LOG.info("Successfully created table {} after creating database {}",
 									op.getFullTableName(), op.getDatabaseName());
+							metricsCollector.recordOperationSuccess(op.getType());
 							return;
 						} catch (Exception retryEx) {
 							cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
 									+ " createDatabase+retry failed: " + retryEx.getMessage());
 							LOG.error("Failed to createDatabase+retry for table {}: {}",
 									op.getFullTableName(), retryEx.getMessage());
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
@@ -286,10 +308,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 								+ " EntityNotFoundException: " + e.getMessage());
 						LOG.error("EntityNotFoundException creating table {}: {}",
 								op.getFullTableName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
 						return;
 					}
 				} catch (AmazonServiceException e) {
 					if (isTransientError(e) && attempt < maxRetryAttempts) {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
 						LOG.warn("Transient error creating table {} (attempt {}/{}), retrying in {}ms: {}",
 								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
@@ -297,12 +321,16 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							Thread.sleep(backoff);
 						} catch (InterruptedException ie) {
 							Thread.currentThread().interrupt();
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
 								+ " failed: " + e.getMessage());
 						LOG.error("Failed to create table {}: {}", op.getFullTableName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+						metricsCollector.recordRetryCount(op.getType(), attempt);
 						return;
 					}
 				}
@@ -311,6 +339,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			cwlr.sendToCWL("ERROR: CREATE_TABLE " + op.getFullTableName()
 					+ " failed after " + maxRetryAttempts + " retries");
 			LOG.error("Exhausted retries for CREATE_TABLE {}", op.getFullTableName());
+			metricsCollector.recordOperationFailure(op.getType());
+			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		private void executeDropTable(CatalogOperation op) {
@@ -326,14 +356,18 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					glueClient.deleteTable(request);
 					cwlr.sendToCWL("SUCCESS: DROP_TABLE " + op.getFullTableName());
 					LOG.info("Successfully dropped table {}", op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
+					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
 					return;
 				} catch (EntityNotFoundException e) {
 					cwlr.sendToCWL("INFO: DROP_TABLE " + op.getFullTableName()
 							+ " not found in GDC, skipping");
 					LOG.warn("Table {} not found in GDC during drop, skipping", op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
 					return;
 				} catch (AmazonServiceException e) {
 					if (isTransientError(e) && attempt < maxRetryAttempts) {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
 						LOG.warn("Transient error dropping table {} (attempt {}/{}), retrying in {}ms: {}",
 								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
@@ -341,12 +375,16 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							Thread.sleep(backoff);
 						} catch (InterruptedException ie) {
 							Thread.currentThread().interrupt();
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						cwlr.sendToCWL("ERROR: DROP_TABLE " + op.getFullTableName()
 								+ " failed: " + e.getMessage());
 						LOG.error("Failed to drop table {}: {}", op.getFullTableName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+						metricsCollector.recordRetryCount(op.getType(), attempt);
 						return;
 					}
 				}
@@ -354,6 +392,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			cwlr.sendToCWL("ERROR: DROP_TABLE " + op.getFullTableName()
 					+ " failed after " + maxRetryAttempts + " retries");
 			LOG.error("Exhausted retries for DROP_TABLE {}", op.getFullTableName());
+			metricsCollector.recordOperationFailure(op.getType());
+			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		@SuppressWarnings("unchecked")
@@ -373,14 +413,18 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					cwlr.sendToCWL("SUCCESS: ADD_PARTITIONS " + op.getFullTableName()
 							+ " (" + partitions.size() + " partitions)");
 					LOG.info("Successfully added {} partitions to {}", partitions.size(), op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
+					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
 					return;
 				} catch (EntityNotFoundException e) {
 					cwlr.sendToCWL("INFO: ADD_PARTITIONS " + op.getFullTableName()
 							+ " table not found in GDC, skipping");
 					LOG.warn("Table {} not found in GDC during addPartitions, skipping", op.getFullTableName());
+					metricsCollector.recordOperationFailure(op.getType());
 					return;
 				} catch (AmazonServiceException e) {
 					if (isTransientError(e) && attempt < maxRetryAttempts) {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
 						LOG.warn("Transient error adding partitions to {} (attempt {}/{}), retrying in {}ms: {}",
 								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
@@ -388,12 +432,16 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							Thread.sleep(backoff);
 						} catch (InterruptedException ie) {
 							Thread.currentThread().interrupt();
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						cwlr.sendToCWL("ERROR: ADD_PARTITIONS " + op.getFullTableName()
 								+ " failed: " + e.getMessage());
 						LOG.error("Failed to add partitions to {}: {}", op.getFullTableName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+						metricsCollector.recordRetryCount(op.getType(), attempt);
 						return;
 					}
 				}
@@ -401,6 +449,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			cwlr.sendToCWL("ERROR: ADD_PARTITIONS " + op.getFullTableName()
 					+ " failed after " + maxRetryAttempts + " retries");
 			LOG.error("Exhausted retries for ADD_PARTITIONS {}", op.getFullTableName());
+			metricsCollector.recordOperationFailure(op.getType());
+			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		@SuppressWarnings("unchecked")
@@ -421,14 +471,18 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							+ " (" + partitionValues.size() + " partitions)");
 					LOG.info("Successfully dropped {} partitions from {}", partitionValues.size(),
 							op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
+					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
 					return;
 				} catch (EntityNotFoundException e) {
 					cwlr.sendToCWL("INFO: DROP_PARTITIONS " + op.getFullTableName()
 							+ " table not found in GDC, skipping");
 					LOG.warn("Table {} not found in GDC during dropPartitions, skipping", op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
 					return;
 				} catch (AmazonServiceException e) {
 					if (isTransientError(e) && attempt < maxRetryAttempts) {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
 						LOG.warn("Transient error dropping partitions from {} (attempt {}/{}), retrying in {}ms: {}",
 								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
@@ -436,12 +490,16 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							Thread.sleep(backoff);
 						} catch (InterruptedException ie) {
 							Thread.currentThread().interrupt();
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						cwlr.sendToCWL("ERROR: DROP_PARTITIONS " + op.getFullTableName()
 								+ " failed: " + e.getMessage());
 						LOG.error("Failed to drop partitions from {}: {}", op.getFullTableName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+						metricsCollector.recordRetryCount(op.getType(), attempt);
 						return;
 					}
 				}
@@ -449,6 +507,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			cwlr.sendToCWL("ERROR: DROP_PARTITIONS " + op.getFullTableName()
 					+ " failed after " + maxRetryAttempts + " retries");
 			LOG.error("Exhausted retries for DROP_PARTITIONS {}", op.getFullTableName());
+			metricsCollector.recordOperationFailure(op.getType());
+			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		private void executeUpdateTable(CatalogOperation op) {
@@ -465,9 +525,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					glueClient.updateTable(request);
 					cwlr.sendToCWL("SUCCESS: UPDATE_TABLE " + op.getFullTableName());
 					LOG.info("Successfully updated table {}", op.getFullTableName());
+					metricsCollector.recordOperationSuccess(op.getType());
+					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
 					return;
 				} catch (AmazonServiceException e) {
 					if (isTransientError(e) && attempt < maxRetryAttempts) {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
 						LOG.warn("Transient error updating table {} (attempt {}/{}), retrying in {}ms: {}",
 								op.getFullTableName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
@@ -475,12 +538,16 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							Thread.sleep(backoff);
 						} catch (InterruptedException ie) {
 							Thread.currentThread().interrupt();
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						cwlr.sendToCWL("ERROR: UPDATE_TABLE " + op.getFullTableName()
 								+ " failed: " + e.getMessage());
 						LOG.error("Failed to update table {}: {}", op.getFullTableName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+						metricsCollector.recordRetryCount(op.getType(), attempt);
 						return;
 					}
 				}
@@ -488,6 +555,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			cwlr.sendToCWL("ERROR: UPDATE_TABLE " + op.getFullTableName()
 					+ " failed after " + maxRetryAttempts + " retries");
 			LOG.error("Exhausted retries for UPDATE_TABLE {}", op.getFullTableName());
+			metricsCollector.recordOperationFailure(op.getType());
+			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		private void executeCreateDatabase(CatalogOperation op) {
@@ -503,15 +572,18 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					glueClient.createDatabase(request);
 					cwlr.sendToCWL("SUCCESS: CREATE_DATABASE " + op.getDatabaseName());
 					LOG.info("Successfully created database {}", op.getDatabaseName());
+					metricsCollector.recordOperationSuccess(op.getType());
+					if (attempt > 0) metricsCollector.recordRetryCount(op.getType(), attempt);
 					return;
 				} catch (AlreadyExistsException e) {
-					// Database already exists — this is fine, just log and continue
 					cwlr.sendToCWL("INFO: CREATE_DATABASE " + op.getDatabaseName()
 							+ " already exists, skipping");
 					LOG.info("Database {} already exists, skipping creation", op.getDatabaseName());
+					metricsCollector.recordOperationSuccess(op.getType());
 					return;
 				} catch (AmazonServiceException e) {
 					if (isTransientError(e) && attempt < maxRetryAttempts) {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						long backoff = (long) (initialBackoffMs * Math.pow(backoffMultiplier, attempt));
 						LOG.warn("Transient error creating database {} (attempt {}/{}), retrying in {}ms: {}",
 								op.getDatabaseName(), attempt + 1, maxRetryAttempts, backoff, e.getMessage());
@@ -519,12 +591,16 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 							Thread.sleep(backoff);
 						} catch (InterruptedException ie) {
 							Thread.currentThread().interrupt();
+							metricsCollector.recordOperationFailure(op.getType());
 							return;
 						}
 					} else {
+						if (e.getStatusCode() == 429) metricsCollector.recordThrottleCount();
 						cwlr.sendToCWL("ERROR: CREATE_DATABASE " + op.getDatabaseName()
 								+ " failed: " + e.getMessage());
 						LOG.error("Failed to create database {}: {}", op.getDatabaseName(), e.getMessage());
+						metricsCollector.recordOperationFailure(op.getType());
+						metricsCollector.recordRetryCount(op.getType(), attempt);
 						return;
 					}
 				}
@@ -532,6 +608,8 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 			cwlr.sendToCWL("ERROR: CREATE_DATABASE " + op.getDatabaseName()
 					+ " failed after " + maxRetryAttempts + " retries");
 			LOG.error("Exhausted retries for CREATE_DATABASE {}", op.getDatabaseName());
+			metricsCollector.recordOperationFailure(op.getType());
+			metricsCollector.recordRetryCount(op.getType(), maxRetryAttempts);
 		}
 
 		boolean isTransientError(AmazonServiceException e) {
@@ -583,8 +661,9 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
 		// start the queue processor thread
 		CloudWatchLogsReporter cwlr = new CloudWatchLogsReporter(this.config);
+		MetricsCollector metricsCollector = MetricsCollectorFactory.create(config);
 		GlueCatalogQueueProcessor glueCatalogQueueProcessor = new GlueCatalogQueueProcessor(
-				this.glueClient, cwlr, this.catalogId, this.dropTableIfExists, this.createMissingDB,
+				this.glueClient, cwlr, metricsCollector, this.catalogId, this.dropTableIfExists, this.createMissingDB,
 				this.batchWindowSeconds * 1000, this.retryInitialBackoffMs,
 				this.retryBackoffMultiplier, this.retryMaxAttempts);
 		queueProcessor = new Thread(glueCatalogQueueProcessor, "GlueCatalogSyncThread");
@@ -592,7 +671,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 
 		// add a shutdown hook to close the connections
 		Runtime.getRuntime()
-				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(glueCatalogQueueProcessor), "Shutdown-thread"));
+				.addShutdownHook(new Thread(new SyncAgentShutdownRoutine(glueCatalogQueueProcessor, metricsCollector), "Shutdown-thread"));
 
 		LOG.info(String.format("%s online, using GDC Direct API (region: %s, catalogId: %s)",
 				this.getClass().getCanonicalName(),

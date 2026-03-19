@@ -47,10 +47,12 @@ public class GlueCatalogQueueProcessorTest {
         Constructor<?> ctor = processorClass.getDeclaredConstructor(
             HiveGlueCatalogSyncAgent.class,
             AWSGlue.class, CloudWatchLogsReporter.class,
+            MetricsCollector.class,
             String.class, boolean.class, boolean.class,
             int.class, int.class, double.class, int.class);
         ctor.setAccessible(true);
         return ctor.newInstance(agent, mockGlue, mockCwlr,
+            new NoOpMetricsCollector(),
             null, dropTableIfExists, createMissingDB,
             100, 10, 2.0, maxRetryAttempts);
     }

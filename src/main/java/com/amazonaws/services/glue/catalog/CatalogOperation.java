@@ -16,6 +16,7 @@ public class CatalogOperation {
     private final String tableName;       // null for CREATE_DATABASE
     private final Object payload;         // type-specific payload
     private final long timestamp;         // for ordering within batch
+    private final long createdAtMillis;   // wall-clock time for sync lag calculation
 
     public CatalogOperation(OperationType type, String databaseName, String tableName, Object payload) {
         this.type = type;
@@ -23,6 +24,7 @@ public class CatalogOperation {
         this.tableName = tableName;
         this.payload = payload;
         this.timestamp = System.nanoTime();
+        this.createdAtMillis = System.currentTimeMillis();
     }
 
     public OperationType getType() { return type; }
@@ -33,6 +35,7 @@ public class CatalogOperation {
     public <T> T getPayload() { return (T) payload; }
 
     public long getTimestamp() { return timestamp; }
+    public long getCreatedAtMillis() { return createdAtMillis; }
 
     public String getFullTableName() {
         return tableName != null ? databaseName + "." + tableName : databaseName;

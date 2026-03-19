@@ -6,3 +6,5 @@
 nb-configuration.xml
 src/main/.DS_Store
 src/main/.DS_Store
+.hypothesis/
+.jqwik-database
