@@ -140,6 +140,101 @@ Add the Glue Sync Agent's jar to HMS' classpath and restart.
 
 You should see newly created external tables and partitions replicated to Glue Data Catalog and logs in CloudWatch Logs.
 
+## Integration Tests
+
+The project includes end-to-end integration tests that provision an EMR cluster with a standalone Hive Metastore, run catalog operations via Spark, sync to the Glue Data Catalog, and validate the results using Athena.
+
+### What the tests cover
+
+- Hive external tables (Parquet, ORC, CSV) with partitions, schema changes, and drops
+- Iceberg tables (unpartitioned, partitioned, schema evolution, snapshot operations)
+- Iceberg-specific validation: `table_type=ICEBERG`, `metadata_location` with `s3://` prefix, Athena readability
+- Table ownership filtering, conflict handling, and batch operations
+- Full list of scenarios in `integration-tests/test-scenarios.md`
+
+### Prerequisites
+
+- AWS CLI configured with credentials that can create EMR clusters, IAM roles, Glue catalog entries, and run Athena queries
+- Python 3 with `boto3` installed (for the validation script)
+- A VPC subnet ID where the EMR cluster will be launched (must have connectivity to AWS service endpoints — see `integration-tests/README.md` for details)
+- An S3 bucket for test data, EMR logs, and the sync agent JAR
+- If using Lake Formation: the EMR EC2 instance profile role needs Database Creator and Data Location permissions (see `integration-tests/README.md` for details)
+
+### Running via Maven
+
+The integration tests are behind a Maven profile and won't run during normal builds. To run them:
+
+```bash
+# Build the project first (produces the fat JAR)
+mvn clean package
+
+# Run integration tests
+mvn verify -Pintegration-test \
+  -Dtest.s3.bucket=my-test-bucket \
+  -Dtest.subnet.id=subnet-0abc123def456
+```
+
+Optional parameters:
+
+| Property | Default | Description |
+|---|---|---|
+| `test.aws.region` | `us-east-1` | AWS region for EMR and Glue |
+| `test.emr.release` | `emr-7.1.0` | EMR release label |
+| `test.catalog.id` | *(account default)* | Glue Catalog ID |
+
+### What happens during the run
+
+1. The sync agent fat JAR, bootstrap script, and SQL step scripts are uploaded to S3
+2. A CloudFormation stack (`integration-tests/cfn/emr-integ-test.yaml`) creates an EMR cluster with:
+   - Standalone HMS (Derby-backed, not Glue as the metastore)
+   - A bootstrap action that installs the sync agent JAR into `/usr/lib/hive/auxlib/`
+   - `hive.metastore.event.listeners` configured to the sync agent class
+   - Iceberg support enabled via `spark-defaults` and `iceberg-defaults`
+   - 60-second idle auto-termination so the cluster shuts down shortly after steps complete
+3. Spark SQL steps run on the cluster to create tables, insert data, alter schemas, and drop tables
+4. The sync agent (running as an HMS listener) pushes events to the Glue Data Catalog
+5. A Python validation script checks every synced table via the Glue API and runs Athena queries to confirm readability
+6. On exit (pass or fail), the cleanup routine deletes the CloudFormation stack, Glue catalog entries, and S3 test data
+
+### Running standalone (without Maven)
+
+You can also run the tests directly if you already have a cluster or want more control:
+
+```bash
+cd integration-tests
+
+# If you already have an EMR cluster with the sync agent installed:
+export EMR_CLUSTER_ID=j-XXXXXXXXXXXXX
+export TEST_S3_BUCKET=my-test-bucket
+./run-tests.sh
+
+# Or run the full lifecycle (provision → test → teardown):
+export TEST_S3_BUCKET=my-test-bucket
+export SUBNET_ID=subnet-0abc123def456
+./run-integ-tests.sh
+```
+
+### Project structure
+
+```
+integration-tests/
+├── cfn/
+│   └── emr-integ-test.yaml          # CloudFormation template for EMR cluster
+├── emr-steps/
+│   ├── 01_create_hive_tables.sql     # Parquet, ORC, CSV external tables
+│   ├── 02_create_iceberg_tables.sql  # Iceberg table scenarios
+│   ├── 03_alter_and_drop.sql         # ALTER TABLE, DROP PARTITION
+│   └── 04_drop_table.sql            # DROP TABLE (runs after sync window)
+├── scripts/
+│   └── bootstrap-install-agent.sh    # EMR bootstrap to install the JAR
+├── validate/
+│   └── validate_sync.py             # GDC metadata + Athena readability checks
+├── run-integ-tests.sh               # Full lifecycle orchestrator
+├── run-tests.sh                     # Step submission + validation (existing cluster)
+├── test-scenarios.md                # Detailed test case descriptions
+└── README.md                        # Integration test documentation
+```
+
 ----
 
 Apache 2.0 Software License
