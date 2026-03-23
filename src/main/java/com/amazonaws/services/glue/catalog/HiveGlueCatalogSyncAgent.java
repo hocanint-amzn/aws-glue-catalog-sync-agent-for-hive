@@ -77,7 +77,6 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	 * Private class to cleanup the sync agent - to be used in a Runtime shutdown
 	 * hook
 	 *
-	 * @author meyersi
 	 */
 	private final class SyncAgentShutdownRoutine implements Runnable {
 		private GlueCatalogQueueProcessor p;

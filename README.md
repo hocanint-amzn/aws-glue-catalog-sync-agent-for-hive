@@ -22,9 +22,6 @@ The Catalog Sync Agent supports the following MetaStore events:
 * AddPartition
 * DropPartition
 * CreateDatabase (auto-created when a table references a missing database, if `glue.catalog.createMissingDB` is enabled)
-* GetColumnStatisticsForTable/GetColumnStatisticsForPartition (if `glue.catalog.syncTableStatistics` is enabled)
-* UpdateColumnStatisticsForTable/UpdateColumnStatisticsForPartition (if `glue.catalog.syncTableStatistics` is enabled)
-* DeleteColumnStatisticsForTable/DeleteColumnStatisticsForPartition (if `glue.catalog.syncTableStatistics` is enabled)
 
 ## Installation
 
@@ -400,6 +397,10 @@ integration-tests/
 ```
 
 ----
+
+## Future Enhancements
+* Support Hive Statistics to GDC Statistics
+* 
 
 Apache 2.0 Software License
 
