@@ -111,12 +111,12 @@ Refactor the Hive Glue Catalog Sync Agent to replace Athena JDBC-based DDL execu
 
 ### Requirement 9: Table Blacklisting
 
-**User Story:** As a developer, I want tables that encounter unresolvable conflicts to be blacklisted from further sync operations, so that repeated failures do not cause noise or wasted API calls.
+**User Story:** As a developer, I want tables that encounter unresolvable conflicts to be disallowed from further sync operations, so that repeated failures do not cause noise or wasted API calls.
 
 #### Acceptance Criteria
 
 1. WHEN a table is added to the Blacklist, THE Sync_Agent SHALL skip all subsequent Catalog_Operations for that table.
-2. WHEN a metastore event occurs for a blacklisted table, THE Sync_Agent SHALL log a debug message and not enqueue any Catalog_Operation.
+2. WHEN a metastore event occurs for a disallowed table, THE Sync_Agent SHALL log a debug message and not enqueue any Catalog_Operation.
 3. THE Blacklist SHALL be maintained in memory for the lifetime of the Sync_Agent process.
 
 ### Requirement 10: Operation Batching

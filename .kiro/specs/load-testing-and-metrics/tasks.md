@@ -96,7 +96,7 @@ Implement CloudWatch Metrics instrumentation for the sync agent and a load testi
   - [x] 7.1 Create `integration-tests/load-test/validate-load.py`
     - Accept CLI args: `--database`, `--region`, `--scenario`, `--expected-tables`, `--expected-partitions`, `--metrics-namespace`, `--sync-lag-threshold-ms`, `--s3-output`
     - Poll GDC for table/partition completeness
-    - Query CWL for BLACKLISTED/ERROR entries
+    - Query CWL for DISALLOWED/ERROR entries
     - Query CW Metrics for SyncLagMs, OperationSuccess, OperationFailure, ThrottleCount statistics
     - Compute sync completeness percentage
     - Check sync lag against threshold (default: 300000ms)

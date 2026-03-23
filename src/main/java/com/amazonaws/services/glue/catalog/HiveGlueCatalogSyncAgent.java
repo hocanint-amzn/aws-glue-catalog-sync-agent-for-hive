@@ -45,6 +45,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private static final String GLUE_CATALOG_BATCH_WINDOW_SECONDS = "glue.catalog.batch.window.seconds";
 	private static final String GLUE_CATALOG_SYNC_TABLE_STATISTICS = "glue.catalog.syncTableStatistics";
 	private static final String GLUE_CATALOG_QUEUE_CAPACITY = "glue.catalog.queue.capacity";
+	private static final String GLUE_CATALOG_TABLE_SYSTEM_OWNERSHIP_PROP = "table.system.ownership";
 	private static final int DEFAULT_QUEUE_CAPACITY = 50000;
 
 	/**
@@ -69,7 +70,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	private String catalogId;
 	private boolean syncTableStatistics = false;
 	private int batchWindowSeconds = 60;
-	private final Set<String> blacklistedTables = ConcurrentHashMap.newKeySet();
+	private final Set<String> disallowedTables = ConcurrentHashMap.newKeySet();
 	private MetricsCollector metricsCollector;
 
 	/**
@@ -266,7 +267,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 					}
 				} else {
 					addToBlacklist(op.getDatabaseName(), op.getTableName());
-					cwlr.sendToCWL("BLACKLISTED: CREATE_TABLE " + op.getFullTableName()
+					cwlr.sendToCWL("DISALLOWED: CREATE_TABLE " + op.getFullTableName()
 							+ " already exists and dropTableIfExists is disabled");
 					LOG.warn("Table {} already exists and dropTableIfExists is disabled, blacklisting",
 							op.getFullTableName());
@@ -542,7 +543,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		if (table.getParameters() == null) {
 			return true;
 		}
-		String ownership = table.getParameters().get("table.system.ownership");
+		String ownership = table.getParameters().get(GLUE_CATALOG_TABLE_SYSTEM_OWNERSHIP_PROP);
 		if ("gdc".equals(ownership)) {
 			LOG.debug("Table {} is owned by GDC, skipping sync", getFqtn(table));
 			return false;
@@ -551,12 +552,12 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	}
 
 	/**
-	 * Checks if a table is blacklisted from sync operations.
+	 * Checks if a table is disallowed from sync operations.
 	 */
-	boolean isBlacklisted(String dbName, String tableName) {
+	boolean isDisallowed(String dbName, String tableName) {
 		String key = dbName + "." + tableName;
-		if (blacklistedTables.contains(key)) {
-			LOG.debug("Table {} is blacklisted, skipping sync", key);
+		if (disallowedTables.contains(key)) {
+			LOG.debug("Table {} is disallowed, skipping sync", key);
 			return true;
 		}
 		return false;
@@ -567,7 +568,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 	 */
 	void addToBlacklist(String dbName, String tableName) {
 		String key = dbName + "." + tableName;
-		blacklistedTables.add(key);
+		disallowedTables.add(key);
 		LOG.info("Table {} added to blacklist", key);
 	}
 
@@ -625,7 +626,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		if (!isTableOwnershipValid(table)) {
 			return;
 		}
-		if (isBlacklisted(dbName, tableName)) {
+		if (isDisallowed(dbName, tableName)) {
 			return;
 		}
 
@@ -655,7 +656,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		if (!isTableOwnershipValid(table)) {
 			return;
 		}
-		if (isBlacklisted(dbName, tableName)) {
+		if (isDisallowed(dbName, tableName)) {
 			return;
 		}
 
@@ -690,7 +691,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		if (!isTableOwnershipValid(table)) {
 			return;
 		}
-		if (isBlacklisted(dbName, tableName)) {
+		if (isDisallowed(dbName, tableName)) {
 			return;
 		}
 
@@ -742,7 +743,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		if (!isTableOwnershipValid(table)) {
 			return;
 		}
-		if (isBlacklisted(dbName, tableName)) {
+		if (isDisallowed(dbName, tableName)) {
 			return;
 		}
 
@@ -785,7 +786,7 @@ public class HiveGlueCatalogSyncAgent extends MetaStoreEventListener {
 		if (!isTableOwnershipValid(newTable)) {
 			return;
 		}
-		if (isBlacklisted(dbName, tableName)) {
+		if (isDisallowed(dbName, tableName)) {
 			return;
 		}
 

@@ -28,7 +28,7 @@ import net.jqwik.api.Provide;
  * Tests Properties 3-7 from the design document, covering:
  * - Event filtering on S3 location (Property 3)
  * - Table ownership filtering (Property 4)
- * - Blacklisted table exclusion (Property 5)
+ * - Disallowed table exclusion (Property 5)
  * - Suppress drop events flag (Property 6)
  * - S3-only partition filtering (Property 7)
  */
@@ -334,31 +334,31 @@ public class EventHandlerPropertyTest {
     }
 
     // ========================================================================
-    // Property 5: Blacklisted Tables Are Excluded From All Operations
-    // Feature: gdc-direct-api-sync, Property 5: Blacklisted Tables Are Excluded From All Operations
+    // Property 5: Disallowed Tables Are Excluded From All Operations
+    // Feature: gdc-direct-api-sync, Property 5: Disallowed Tables Are Excluded From All Operations
     // ========================================================================
 
     /**
      * Validates: Requirements 9.1, 9.2
      *
-     * For any table added to the blacklist, isBlacklisted returns true.
-     * For tables not in the blacklist, isBlacklisted returns false.
+     * For any table added to the blacklist, isDisallowed returns true.
+     * For tables not in the blacklist, isDisallowed returns false.
      */
     @Property(tries = 100)
-    void blacklistedTablesAreDetected(@ForAll("identifiers") String dbName,
+    void disallowedTablesAreDetected(@ForAll("identifiers") String dbName,
                                        @ForAll("identifiers") String tableName) {
         HiveGlueCatalogSyncAgent agent = createAgent();
 
-        // Before blacklisting, should not be blacklisted
-        assert !agent.isBlacklisted(dbName, tableName)
-            : "Table should not be blacklisted before adding";
+        // Before blacklisting, should not be disallowed
+        assert !agent.isDisallowed(dbName, tableName)
+            : "Table should not be disallowed before adding";
 
         // Add to blacklist
         agent.addToBlacklist(dbName, tableName);
 
-        // After blacklisting, should be blacklisted
-        assert agent.isBlacklisted(dbName, tableName)
-            : "Table should be blacklisted after adding";
+        // After blacklisting, should be disallowed
+        assert agent.isDisallowed(dbName, tableName)
+            : "Table should be disallowed after adding";
     }
 
     /**
@@ -379,21 +379,21 @@ public class EventHandlerPropertyTest {
 
         agent.addToBlacklist(dbName, tableName1);
 
-        assert agent.isBlacklisted(dbName, tableName1)
-            : "Blacklisted table should be detected";
-        assert !agent.isBlacklisted(dbName, tableName2)
-            : "Non-blacklisted table should not be detected";
+        assert agent.isDisallowed(dbName, tableName1)
+            : "Disallowed table should be detected";
+        assert !agent.isDisallowed(dbName, tableName2)
+            : "Non-disallowed table should not be detected";
     }
 
     /**
      * Validates: Requirements 9.1, 9.2
      *
      * Blacklisting a table prevents addToQueue from being called for that table.
-     * We verify this by checking that the queue remains empty when a blacklisted
+     * We verify this by checking that the queue remains empty when a disallowed
      * table's operation is attempted through the agent's checks.
      */
     @Property(tries = 100)
-    void blacklistedTableProducesNoQueuedOperations(
+    void disallowedTableProducesNoQueuedOperations(
             @ForAll("identifiers") String dbName,
             @ForAll("identifiers") String tableName) {
 
@@ -407,13 +407,13 @@ public class EventHandlerPropertyTest {
 
         // The event handler pattern: check eligibility, ownership, blacklist, then enqueue
         if (agent.isSyncEligible(table) && agent.isTableOwnershipValid(table)
-                && !agent.isBlacklisted(dbName, tableName)) {
+                && !agent.isDisallowed(dbName, tableName)) {
             agent.addToQueue(new CatalogOperation(
                 CatalogOperation.OperationType.CREATE_TABLE, dbName, tableName, null));
         }
 
         assert queue.isEmpty()
-            : "Blacklisted table should produce no queued operations";
+            : "Disallowed table should produce no queued operations";
     }
 
 
@@ -445,7 +445,7 @@ public class EventHandlerPropertyTest {
         boolean suppressAllDropEvents = true; // mirrors the agent's field
         if (!suppressAllDropEvents) {
             if (agent.isSyncEligible(table) && agent.isTableOwnershipValid(table)
-                    && !agent.isBlacklisted(dbName, tableName)) {
+                    && !agent.isDisallowed(dbName, tableName)) {
                 agent.addToQueue(new CatalogOperation(
                     CatalogOperation.OperationType.DROP_TABLE, dbName, tableName, null));
             }
@@ -476,7 +476,7 @@ public class EventHandlerPropertyTest {
         boolean suppressAllDropEvents = false;
         if (!suppressAllDropEvents) {
             if (agent.isSyncEligible(table) && agent.isTableOwnershipValid(table)
-                    && !agent.isBlacklisted(dbName, tableName)) {
+                    && !agent.isDisallowed(dbName, tableName)) {
                 agent.addToQueue(new CatalogOperation(
                     CatalogOperation.OperationType.DROP_TABLE, dbName, tableName, null));
             }
@@ -515,7 +515,7 @@ public class EventHandlerPropertyTest {
         // Simulate the event handler pattern
         if (!suppress) {
             if (agent.isSyncEligible(table) && agent.isTableOwnershipValid(table)
-                    && !agent.isBlacklisted(dbName, tableName)) {
+                    && !agent.isDisallowed(dbName, tableName)) {
                 agent.addToQueue(new CatalogOperation(
                     CatalogOperation.OperationType.DROP_TABLE, dbName, tableName, null));
             }

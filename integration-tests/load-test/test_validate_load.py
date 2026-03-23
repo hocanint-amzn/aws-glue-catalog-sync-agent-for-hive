@@ -31,7 +31,7 @@ build_validation_report = validate_load.build_validation_report
 table_name_st = st.from_regex(r"[a-z][a-z0-9_]{2,30}", fullmatch=True)
 table_name_set_st = st.frozensets(table_name_st, min_size=1, max_size=50)
 
-# Log entry text without BLACKLISTED or ERROR keywords
+# Log entry text without DISALLOWED or ERROR keywords
 safe_log_text_st = st.text(
     alphabet=st.characters(
         whitelist_categories=("L", "N", "P", "Z"),
@@ -39,7 +39,7 @@ safe_log_text_st = st.text(
     ),
     min_size=1,
     max_size=100,
-).filter(lambda s: "BLACKLISTED" not in s and "ERROR" not in s)
+).filter(lambda s: "DISALLOWED" not in s and "ERROR" not in s)
 
 # Positive floats for lag/threshold values
 positive_float_st = st.floats(min_value=0.0, max_value=1e9, allow_nan=False, allow_infinity=False)
@@ -111,7 +111,7 @@ class TestCWLErrorDetection:
     """Property 12: CWL error detection.
 
     For any set of CloudWatch Logs entries, the validator correctly
-    identifies all entries containing BLACKLISTED or ERROR status.
+    identifies all entries containing DISALLOWED or ERROR status.
 
     **Validates: Requirements 7.2**
     """
@@ -119,30 +119,30 @@ class TestCWLErrorDetection:
     @given(safe_entries=st.lists(safe_log_text_st, min_size=0, max_size=20))
     @settings(max_examples=200)
     def test_no_false_positives(self, safe_entries):
-        """Entries without ERROR or BLACKLISTED are never flagged."""
+        """Entries without ERROR or DISALLOWED are never flagged."""
         result = detect_cwl_errors(safe_entries)
         assert result["errors"] == []
-        assert result["blacklisted"] == []
+        assert result["disallowed"] == []
 
     @given(
         safe_entries=st.lists(safe_log_text_st, min_size=0, max_size=10),
         error_count=st.integers(min_value=1, max_value=10),
-        blacklisted_count=st.integers(min_value=1, max_value=10),
+        disallowed_count=st.integers(min_value=1, max_value=10),
     )
     @settings(max_examples=200)
-    def test_detects_all_errors_and_blacklisted(
-        self, safe_entries, error_count, blacklisted_count
+    def test_detects_all_errors_and_disallowed(
+        self, safe_entries, error_count, disallowed_count
     ):
-        """All ERROR and BLACKLISTED entries are detected."""
+        """All ERROR and DISALLOWED entries are detected."""
         error_entries = [f"ERROR: failure #{i}" for i in range(error_count)]
-        blacklisted_entries = [
-            f"BLACKLISTED table #{i}" for i in range(blacklisted_count)
+        disallowed_entries = [
+            f"DISALLOWED table #{i}" for i in range(disallowed_count)
         ]
-        all_entries = safe_entries + error_entries + blacklisted_entries
+        all_entries = safe_entries + error_entries + disallowed_entries
 
         result = detect_cwl_errors(all_entries)
         assert len(result["errors"]) == error_count
-        assert len(result["blacklisted"]) == blacklisted_count
+        assert len(result["disallowed"]) == disallowed_count
 
     @given(
         prefix=safe_log_text_st,
@@ -161,21 +161,21 @@ class TestCWLErrorDetection:
         suffix=safe_log_text_st,
     )
     @settings(max_examples=200)
-    def test_blacklisted_detected_anywhere_in_entry(self, prefix, suffix):
-        """BLACKLISTED keyword is detected regardless of position in the entry."""
-        entry = f"{prefix} BLACKLISTED {suffix}"
+    def test_disallowed_detected_anywhere_in_entry(self, prefix, suffix):
+        """DISALLOWED keyword is detected regardless of position in the entry."""
+        entry = f"{prefix} DISALLOWED {suffix}"
         result = detect_cwl_errors([entry])
-        assert len(result["blacklisted"]) == 1
-        assert result["blacklisted"][0] == entry
+        assert len(result["disallowed"]) == 1
+        assert result["disallowed"][0] == entry
 
     @given(count=st.integers(min_value=1, max_value=10))
     @settings(max_examples=200)
     def test_entry_with_both_keywords(self, count):
-        """An entry containing both ERROR and BLACKLISTED appears in both lists."""
-        entries = [f"ERROR BLACKLISTED item {i}" for i in range(count)]
+        """An entry containing both ERROR and DISALLOWED appears in both lists."""
+        entries = [f"ERROR DISALLOWED item {i}" for i in range(count)]
         result = detect_cwl_errors(entries)
         assert len(result["errors"]) == count
-        assert len(result["blacklisted"]) == count
+        assert len(result["disallowed"]) == count
 
 
 # --- Property 13: Sync lag threshold enforcement ---
@@ -241,7 +241,7 @@ REQUIRED_REPORT_FIELDS = {
     "operation_failure_count",
     "throttle_count",
     "cwl_errors",
-    "cwl_blacklisted",
+    "cwl_disallowed",
     "pass",
     "failure_reasons",
 }
@@ -303,7 +303,7 @@ class TestValidationReportCompleteness:
             failure_count=failure_count,
             throttle_count=throttle_count,
             cwl_errors=[],
-            cwl_blacklisted=[],
+            cwl_disallowed=[],
             failure_reasons=[],
         )
         assert set(report.keys()) == REQUIRED_REPORT_FIELDS
@@ -330,7 +330,7 @@ class TestValidationReportCompleteness:
             failure_count=0,
             throttle_count=0,
             cwl_errors=[],
-            cwl_blacklisted=[],
+            cwl_disallowed=[],
             failure_reasons=failure_reasons,
         )
         if len(failure_reasons) == 0:
@@ -375,7 +375,7 @@ class TestValidationReportCompleteness:
             failure_count=failure_count,
             throttle_count=throttle_count,
             cwl_errors=["err1"],
-            cwl_blacklisted=["bl1"],
+            cwl_disallowed=["bl1"],
             failure_reasons=["reason"],
         )
         assert report["scenario"] == scenario
@@ -391,4 +391,4 @@ class TestValidationReportCompleteness:
         assert report["partitions_expected"] == 100
         assert report["partitions_found"] == 90
         assert report["cwl_errors"] == ["err1"]
-        assert report["cwl_blacklisted"] == ["bl1"]
+        assert report["cwl_disallowed"] == ["bl1"]

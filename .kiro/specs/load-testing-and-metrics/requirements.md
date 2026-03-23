@@ -103,7 +103,7 @@ This feature adds CloudWatch Metrics instrumentation to the Hive Glue Catalog Sy
 #### Acceptance Criteria
 
 1. WHEN validation runs, THE Load_Test_Framework SHALL verify 100% sync completeness by checking that every HMS table and partition created by the DDL exists in the GDC.
-2. WHEN validation runs, THE Load_Test_Framework SHALL query CWL for the HIVE_METADATA_SYNC log group and verify that no entries contain BLACKLISTED or permanent ERROR status.
+2. WHEN validation runs, THE Load_Test_Framework SHALL query CWL for the HIVE_METADATA_SYNC log group and verify that no entries contain DISALLOWED or permanent ERROR status.
 3. WHEN CW_Metrics are enabled for the test run, THE Load_Test_Framework SHALL query CloudWatch Metrics to collect Sync_Lag, throughput (OperationSuccess count), and error rate (OperationFailure count) statistics.
 4. WHEN Sync_Lag exceeds a configurable threshold (default: 300000 milliseconds for 1000 operations), THE Load_Test_Framework SHALL report the test as failed.
 5. THE Load_Test_Framework SHALL produce a summary report containing: Scenario name, total operations, sync completeness percentage, average and p99 Sync_Lag, total OperationSuccess count, total OperationFailure count, total ThrottleCount, and pass/fail verdict.

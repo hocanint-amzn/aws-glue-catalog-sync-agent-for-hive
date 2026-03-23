@@ -4,7 +4,7 @@ Load test validation script for Hive Glue Catalog Sync Agent.
 
 Validates sync completeness and performance after a load test run by:
 - Polling GDC for table/partition completeness
-- Querying CloudWatch Logs for BLACKLISTED/ERROR entries
+- Querying CloudWatch Logs for DISALLOWED/ERROR entries
 - Querying CloudWatch Metrics for SyncLagMs, OperationSuccess, OperationFailure, ThrottleCount
 - Producing a JSON summary report with pass/fail verdict
 
@@ -47,23 +47,23 @@ def compute_sync_completeness(expected_tables, actual_tables):
 
 
 def detect_cwl_errors(log_entries):
-    """Identify CloudWatch Logs entries containing BLACKLISTED or ERROR status.
+    """Identify CloudWatch Logs entries containing DISALLOWED or ERROR status.
 
     Args:
         log_entries: List of log entry strings.
 
     Returns:
         Dict with 'errors' (list of entries containing ERROR)
-        and 'blacklisted' (list of entries containing BLACKLISTED).
+        and 'disallowed' (list of entries containing DISALLOWED).
     """
     errors = []
-    blacklisted = []
+    disallowed = []
     for entry in log_entries:
-        if "BLACKLISTED" in entry:
-            blacklisted.append(entry)
+        if "DISALLOWED" in entry:
+            disallowed.append(entry)
         if "ERROR" in entry:
             errors.append(entry)
-    return {"errors": errors, "blacklisted": blacklisted}
+    return {"errors": errors, "disallowed": disallowed}
 
 
 def check_sync_lag(avg_lag_ms, threshold_ms):
@@ -93,7 +93,7 @@ def build_validation_report(
     failure_count,
     throttle_count,
     cwl_errors,
-    cwl_blacklisted,
+    cwl_disallowed,
     failure_reasons,
 ):
     """Build a structured validation summary report.
@@ -112,7 +112,7 @@ def build_validation_report(
         failure_count: Total OperationFailure count.
         throttle_count: Total ThrottleCount.
         cwl_errors: List of CWL error entries.
-        cwl_blacklisted: List of CWL blacklisted entries.
+        cwl_disallowed: List of CWL disallowed entries.
         failure_reasons: List of failure reason strings.
 
     Returns:
@@ -133,7 +133,7 @@ def build_validation_report(
         "operation_failure_count": failure_count,
         "throttle_count": throttle_count,
         "cwl_errors": cwl_errors,
-        "cwl_blacklisted": cwl_blacklisted,
+        "cwl_disallowed": cwl_disallowed,
         "pass": passed,
         "failure_reasons": failure_reasons,
     }
@@ -284,9 +284,9 @@ def run_validation(args):
 
     if cwl_result["errors"]:
         failure_reasons.append(f"Found {len(cwl_result['errors'])} CWL ERROR entries")
-    if cwl_result["blacklisted"]:
+    if cwl_result["disallowed"]:
         failure_reasons.append(
-            f"Found {len(cwl_result['blacklisted'])} CWL BLACKLISTED entries"
+            f"Found {len(cwl_result['disallowed'])} CWL DISALLOWED entries"
         )
 
     # 4. Query CW Metrics
@@ -342,7 +342,7 @@ def run_validation(args):
         failure_count=failure_count,
         throttle_count=throttle_count,
         cwl_errors=cwl_result["errors"],
-        cwl_blacklisted=cwl_result["blacklisted"],
+        cwl_disallowed=cwl_result["disallowed"],
         failure_reasons=failure_reasons,
     )
 

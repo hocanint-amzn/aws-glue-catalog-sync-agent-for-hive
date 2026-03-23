@@ -263,7 +263,7 @@ SCENARIOS = {
     "operation_failure_count": 0,
     "throttle_count": 2,
     "cwl_errors": [],
-    "cwl_blacklisted": [],
+    "cwl_disallowed": [],
     "pass": true,
     "failure_reasons": []
 }
@@ -342,7 +342,7 @@ SCENARIOS = {
 
 ### Property 12: CWL error detection
 
-*For any* set of CloudWatch Logs entries, the validator correctly identifies all entries containing `BLACKLISTED` or `ERROR` status and includes them in the failure report.
+*For any* set of CloudWatch Logs entries, the validator correctly identifies all entries containing `DISALLOWED` or `ERROR` status and includes them in the failure report.
 
 **Validates: Requirements 7.2**
 

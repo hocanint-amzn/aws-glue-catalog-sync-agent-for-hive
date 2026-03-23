@@ -18,7 +18,7 @@ graph TD
     HMS[Hive Metastore] -->|Events| SA[HiveGlueCatalogSyncAgent]
     SA -->|Ownership Check| OC{table.system.ownership}
     OC -->|gdc| SKIP[Skip Event]
-    OC -->|hms / absent| BL{Blacklisted?}
+    OC -->|hms / absent| BL{Disallowed?}
     BL -->|yes| SKIP2[Skip Event]
     BL -->|no| S3{S3 Location?}
     S3 -->|no| SKIP3[Skip Event]
@@ -155,9 +155,9 @@ private final class GlueCatalogQueueProcessor implements Runnable {
 The main class changes:
 - Queue type: `ConcurrentLinkedQueue<CatalogOperation>` (was `ConcurrentLinkedQueue<String>`)
 - Remove: `athenaConnection`, `configureAthenaConnection()`, `addToAthenaQueue(String)`
-- Add: `glueClient` (AWSGlue), `catalogId`, `blacklistedTables` (ConcurrentHashMap.KeySetView)
+- Add: `glueClient` (AWSGlue), `catalogId`, `disallowedTables` (ConcurrentHashMap.KeySetView)
 - Add: `isTableOwnershipValid(Table)` — checks `table.system.ownership`
-- Add: `isBlacklisted(String dbName, String tableName)` — checks blacklist
+- Add: `isDisallowed(String dbName, String tableName)` — checks blacklist
 - Add: `isSyncEligible(Table)` — checks S3 location (after s3a/s3n translation), no custom storage handler, and ownership
 - Add: `addToQueue(CatalogOperation)` — replaces `addToAthenaQueue`
 - Event handlers build `CatalogOperation` objects instead of DDL strings
@@ -303,7 +303,7 @@ Within each group, operations preserve their original enqueue order (FIFO). Only
 
 **Validates: Requirements 3.1, 3.2, 3.3**
 
-### Property 5: Blacklisted Tables Are Excluded From All Operations
+### Property 5: Disallowed Tables Are Excluded From All Operations
 
 *For any* table that has been added to the blacklist, all subsequent metastore events for that table SHALL result in no CatalogOperation being enqueued, regardless of event type.
 
@@ -390,10 +390,10 @@ The following Hive features have no direct equivalent in the Glue Data Catalog. 
 
 ### Blacklisting Behavior
 
-- Tables are blacklisted when `AlreadyExistsException` occurs and `dropTableIfExists` is disabled
+- Tables are disallowed when `AlreadyExistsException` occurs and `dropTableIfExists` is disabled
 - Blacklist is checked at event handler level (before enqueuing) for efficiency
 - Blacklist is a `ConcurrentHashMap.newKeySet()` for thread safety
-- Blacklisted table names are logged at DEBUG level when events are skipped
+- Disallowed table names are logged at DEBUG level when events are skipped
 
 ## Testing Strategy
 
@@ -414,7 +414,7 @@ The following Hive features have no direct equivalent in the Glue Data Catalog. 
 2. **Property 2**: Generate random S3 paths with s3://, s3a://, s3n:// prefixes and verify `translateLocation()` normalizes correctly.
 3. **Property 3**: Generate random Tables with varying tableType and location prefixes, invoke event handlers, and verify queue state matches the external+s3 predicate.
 4. **Property 4**: Generate random Tables with varying `table.system.ownership` values, invoke event handlers, and verify only non-gdc tables produce operations.
-5. **Property 5**: Generate random table names, add some to blacklist, invoke events, and verify blacklisted tables produce no operations.
+5. **Property 5**: Generate random table names, add some to blacklist, invoke events, and verify disallowed tables produce no operations.
 6. **Property 6**: Generate random Tables, toggle `suppressAllDropEvents`, invoke drop events, and verify queue state.
 7. **Property 7**: Generate AddPartition events with mixed S3/non-S3 partitions and verify only S3 partitions appear in the payload.
 8. **Property 8**: Generate random lists of CatalogOperations and verify grouping correctness (partition + coverage).

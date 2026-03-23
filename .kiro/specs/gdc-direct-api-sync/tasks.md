@@ -81,17 +81,17 @@ Refactor the Hive Glue Catalog Sync Agent to replace Athena JDBC with direct AWS
 - [x] 8. Refactor HiveGlueCatalogSyncAgent event handlers
   - [x] 8.1 Add sync eligibility, ownership, and blacklist infrastructure to HiveGlueCatalogSyncAgent
     - Change queue type from `ConcurrentLinkedQueue<String>` to `ConcurrentLinkedQueue<CatalogOperation>`
-    - Add `blacklistedTables` field (`Set<String>` backed by ConcurrentHashMap)
+    - Add `disallowedTables` field (`Set<String>` backed by ConcurrentHashMap)
     - Add `glueClient` (AWSGlue) field, `catalogId` field, `syncTableStatistics` field
     - Add `isSyncEligible(Table)` — checks S3 location (after translation) and no custom storage handler
     - Add `isTableOwnershipValid(Table)` — checks `table.system.ownership` != `gdc`
-    - Add `isBlacklisted(String dbName, String tableName)` — checks blacklist set
+    - Add `isDisallowed(String dbName, String tableName)` — checks blacklist set
     - Add `addToQueue(CatalogOperation)` — replaces `addToAthenaQueue`
     - Read new config properties: region, catalogId, batchWindowSeconds, syncTableStatistics, retry params
     - Remove Athena JDBC fields: athenaConnection, athenaURL, info, configureAthenaConnection()
     - _Requirements: 3.1, 3.2, 3.3, 9.1, 9.2, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9_
   - [x] 8.2 Refactor `onCreateTable` to build and enqueue CREATE_TABLE CatalogOperation
-    - Use `isSyncEligible`, `isTableOwnershipValid`, `isBlacklisted` checks
+    - Use `isSyncEligible`, `isTableOwnershipValid`, `isDisallowed` checks
     - Use `TableInputBuilder.buildTableInput()` to create the payload
     - _Requirements: 4.1, 4.2_
   - [x] 8.3 Refactor `onDropTable` to build and enqueue DROP_TABLE CatalogOperation
@@ -119,10 +119,10 @@ Refactor the Hive Glue Catalog Sync Agent to replace Athena JDBC with direct AWS
     - Generate random Tables with varying `table.system.ownership` values (gdc, hms, absent)
     - Verify only non-gdc tables produce operations
     - **Validates: Requirements 3.1, 3.2, 3.3**
-  - [x] 8.9 Write property test: Blacklisted Tables Excluded
-    - **Property 5: Blacklisted Tables Are Excluded From All Operations**
+  - [x] 8.9 Write property test: Disallowed Tables Excluded
+    - **Property 5: Disallowed Tables Are Excluded From All Operations**
     - Generate random table names, blacklist some, invoke events
-    - Verify blacklisted tables produce no operations
+    - Verify disallowed tables produce no operations
     - **Validates: Requirements 9.1, 9.2**
   - [x] 8.10 Write property test: Suppress Drop Events
     - **Property 6: Suppress Drop Events Flag Blocks All Drop Operations**

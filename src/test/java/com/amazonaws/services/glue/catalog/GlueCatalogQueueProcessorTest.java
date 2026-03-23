@@ -63,8 +63,8 @@ public class GlueCatalogQueueProcessorTest {
     }
 
     @SuppressWarnings("unchecked")
-    private Set<String> getBlacklistedTables(HiveGlueCatalogSyncAgent agent) throws Exception {
-        Field field = HiveGlueCatalogSyncAgent.class.getDeclaredField("blacklistedTables");
+    private Set<String> getDisallowedTables(HiveGlueCatalogSyncAgent agent) throws Exception {
+        Field field = HiveGlueCatalogSyncAgent.class.getDeclaredField("disallowedTables");
         field.setAccessible(true);
         return (Set<String>) field.get(agent);
     }
@@ -150,11 +150,11 @@ public class GlueCatalogQueueProcessorTest {
         ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
         verify(mockCwlr, atLeastOnce()).sendToCWL(captor.capture());
         boolean hasBlacklist = captor.getAllValues().stream()
-            .anyMatch(msg -> msg.contains("BLACKLISTED") && msg.contains("mydb.mytable"));
+            .anyMatch(msg -> msg.contains("DISALLOWED") && msg.contains("mydb.mytable"));
         assertTrue("CWL should contain a blacklist message", hasBlacklist);
         // Verify the table is in the blacklist
-        Set<String> blacklisted = getBlacklistedTables(agent);
-        assertTrue("Table should be blacklisted", blacklisted.contains("mydb.mytable"));
+        Set<String> disallowed = getDisallowedTables(agent);
+        assertTrue("Table should be disallowed", disallowed.contains("mydb.mytable"));
     }
 
     // ---- Test 3: EntityNotFoundException on createTable + createMissingDB=true ----

@@ -113,7 +113,7 @@ Validation checks per scenario:
 ### 3.3 AlreadyExistsException with dropTableIfExists=false
 - Pre-create a table in GDC
 - Create a table with the same name in HMS (with dropTableIfExists disabled)
-- **Validate**: Table is blacklisted, GDC table unchanged
+- **Validate**: Table is disallowed, GDC table unchanged
 
 ---
 

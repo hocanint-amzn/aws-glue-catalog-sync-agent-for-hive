@@ -90,7 +90,7 @@ mvn verify -Pload-test \
 A scenario passes when all of the following hold:
 
 1. **100% sync completeness** — every table and partition created by the DDL exists in the Glue Data Catalog.
-2. **No CWL errors** — no `BLACKLISTED` or `ERROR` entries in the `HIVE_METADATA_SYNC` CloudWatch Logs group.
+2. **No CWL errors** — no `DISALLOWED` or `ERROR` entries in the `HIVE_METADATA_SYNC` CloudWatch Logs group.
 3. **Sync lag within threshold** — average `SyncLagMs` does not exceed 300,000 ms (configurable via `--sync-lag-threshold-ms`).
 
 The overall load test exits `0` only if every selected scenario passes.
@@ -155,7 +155,7 @@ Each scenario produces a JSON report with the following fields:
   "operation_failure_count": 0,
   "throttle_count": 0,
   "cwl_errors": [],
-  "cwl_blacklisted": [],
+  "cwl_disallowed": [],
   "pass": true,
   "failure_reasons": []
 }

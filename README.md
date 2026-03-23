@@ -8,7 +8,7 @@ This project provides a jar that implements the [MetastoreEventListener](https:/
 
 Within the [HiveGlueCatalogSyncAgent](src/main/java/com/amazonaws/services/glue/catalog/HiveGlueCatalogSyncAgent.java), metastore events are captured as structured `CatalogOperation` objects and written to a bounded `LinkedBlockingQueue` (default capacity: 50,000, configurable). A separate queue processor thread drains the queue in configurable batch windows, groups and merges operations per table for efficiency, and executes them against the Glue Data Catalog API with exponential-backoff retry. When the queue is full, operations are rejected and logged to a dedicated machine-parseable logger for downstream manual sync.
 
-![internals](internals.png)
+For a more detailed architecture diagram, please see [here](docs/architecture-diagram.md)
 
 Operational metrics (queue depth, batch size, sync lag, success/failure counts, throttle events, queue rejections) are published to Amazon CloudWatch, and sync activity is logged to CloudWatch Logs.
 
@@ -22,6 +22,9 @@ The Catalog Sync Agent supports the following MetaStore events:
 * AddPartition
 * DropPartition
 * CreateDatabase (auto-created when a table references a missing database, if `glue.catalog.createMissingDB` is enabled)
+* GetColumnStatisticsForTable/GetColumnStatisticsForPartition (if `glue.catalog.syncTableStatistics` is enabled)
+* UpdateColumnStatisticsForTable/UpdateColumnStatisticsForPartition (if `glue.catalog.syncTableStatistics` is enabled)
+* DeleteColumnStatisticsForTable/DeleteColumnStatisticsForPartition (if `glue.catalog.syncTableStatistics` is enabled)
 
 ## Installation
 
@@ -45,6 +48,24 @@ If you install the base JAR (not the fat JAR), you must ensure the following dep
 * Hive Metastore (3.1.2)
 * Hive Common (3.1.2)
 * Hive Exec (3.1.2)
+
+## Notes
+
+### Eligable Tables To Sync
+Not all tables will be synced from HMS to GDC. The criteria is available in isSyncEligible(), and isTableOwnershipValid() in [HiveGlueCatalogSyncAgent](src/main/java/com/amazonaws/services/glue/catalog/HiveGlueCatalogSyncAgent.java):
+* Tables without SerDe's specified do not get synced
+* Tables without StorageHandlers do not get synced
+* Tables that do not use S3 do not get synced
+* Tables where the table property "table.system.ownership" to "gdc" does not get synced.
+* Disallowed tables (tables that exist in GDC but a Create Table is issued for the same table). 
+
+### Recommended steps
+These steps are highly recommended:
+* Increase the JVM memory of your Hive Metastore by 256-512mb. This will ensure that your HMS will have sufficent memory and will not OOM from the extra records that are stored.
+* Set up alarms on queue depth (QueueDepth), failure count (OperationFailure), queue rejection (QueueRejection) and throttle count (ThrottleCount) and take appropriate action. 
+** For OperationFailure, and QueueRejection errors, you will need to manually sync the objects that failed to sync. 
+* For any table objects that are created and managed by Glue Data Catalog, set the table property "table.system.ownership" to "gdc", and this resource does not get sync'ed once its updated in HMS. This precents circular syncing.
+* Have tables created within HMS have a table property "table.system.ownership" set to "hms". This way, any syncs coming from Glue Data Catalog will be filtered to avoid circular syncing.
 
 ## Configuration Instructions
 
@@ -80,7 +101,9 @@ Create an IAM policy with the following permissions:
                 "glue:GetPartitions",
                 "glue:BatchGetPartition"
             ],
-            "Resource": "*"
+            "Resource": [ "arn:aws:glue:[AWS Region]:[AWS Account ID]:catalog",
+                          "arn:aws:glue:[AWS Region]:[AWS Account ID]:database/*",
+                          "arn:aws:glue:[AWS Region]:[AWS Account ID]:table/*/*" ]
         },
         {
             "Sid": "CloudWatchLogs",
@@ -92,7 +115,7 @@ Create an IAM policy with the following permissions:
                 "logs:DescribeLogStreams",
                 "logs:PutLogEvents"
             ],
-            "Resource": "arn:aws:logs:*:*:log-group:HIVE_METADATA_SYNC:*"
+            "Resource": "arn:aws:logs:[AWS Region]:[AWS Account ID]:log-group:HIVE_METADATA_SYNC:*"
         },
         {
             "Sid": "CloudWatchMetrics",
@@ -334,7 +357,7 @@ python3 integration-tests/load-test/validate-load.py \
 4. EMR steps execute the Spark SQL DDL, triggering HMS events that the sync agent processes
 5. After a wait period (proportional to the batch window), `validate-load.py` checks:
    - 100% sync completeness — every expected table and partition exists in the Glue Data Catalog
-   - No CWL errors — no `BLACKLISTED` or `ERROR` entries in the `HIVE_METADATA_SYNC` log group
+   - No CWL errors — no `DISALLOWED` or `ERROR` entries in the `HIVE_METADATA_SYNC` log group
    - Sync lag within threshold — average `SyncLagMs` does not exceed 300,000 ms
 6. Each scenario produces a JSON report uploaded to `s3://<bucket>/load-test/reports/<scenario>-report.json`
 7. On exit (pass or fail), cleanup deletes the CloudFormation stack, Glue databases/tables, and S3 test data
@@ -344,7 +367,7 @@ python3 integration-tests/load-test/validate-load.py \
 A scenario passes when all of the following hold:
 
 1. 100% sync completeness — every table and partition created by the DDL exists in the Glue Data Catalog
-2. No CWL errors — no `BLACKLISTED` or `ERROR` entries in CloudWatch Logs
+2. No CWL errors — no `DISALLOWED` or `ERROR` entries in CloudWatch Logs
 3. Sync lag within threshold — average `SyncLagMs` ≤ 300,000 ms (configurable via `--sync-lag-threshold-ms`)
 
 The overall load test exits `0` only if every selected scenario passes.
